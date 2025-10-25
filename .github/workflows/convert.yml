@@ -2,7 +2,7 @@ name: Convert Meck Parcel Sales to GeoJSON
 
 on:
   schedule:
-    - cron: "15 10 * * 1"   # every Monday 10:15 UTC
+    - cron: "15 10 * * 1"   # every Monday 10:15 UTC (adjust if needed)
   workflow_dispatch:
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
           set -e
           cd data
           SHP_FILE=$(ls *.shp | head -n1)
-          # Meck shapefiles are usually EPSG:2264; reproject to 4326
+          # Meck shapefiles are usually in EPSG:2264; reproject to 4326 for GeoJSON
           ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
 
       # Keep full attribute set to avoid field-name mismatches
@@ -57,4 +57,8 @@ jobs:
       - name: Commit and push
         run: |
           set -e
-          git config user.name "github-actions
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/parcel_sales.geojson
+          git commit -m "Auto-update parcel sales GeoJSON [skip ci]" || echo "No changes to commit"
+          git push
