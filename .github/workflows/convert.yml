@@ -23,7 +23,7 @@ jobs:
         run: |
           mkdir -p data
           cd data
-          curl -L -o Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Downloads/Parcel_Sales.zip"
+          curl -L -o Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
 
       - name: Unzip shapefile
         run: |
