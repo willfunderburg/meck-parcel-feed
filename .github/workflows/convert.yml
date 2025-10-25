@@ -1,0 +1,57 @@
+name: Convert Meck Parcel Sales to GeoJSON
+
+on:
+  schedule:
+    - cron: "15 10 * * 1"   # every Monday 10:15 UTC (adjust time if you want)
+  workflow_dispatch:        # allow manual trigger
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GDAL
+        run: |
+          sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
+          sudo apt-get update -y
+          sudo apt-get install -y gdal-bin unzip curl
+
+      - name: Download shapefile zip
+        run: |
+          mkdir -p data
+          cd data
+          curl -L -o Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Downloads/Parcel_Sales.zip"
+
+      - name: Unzip shapefile
+        run: |
+          cd data
+          unzip -o Parcel_Sales.zip
+
+      - name: Convert to GeoJSON (reproject to WGS84)
+        run: |
+          cd data
+          SHP_FILE=$(ls *.shp | head -n1)
+          # Meck shapefiles are usually in EPSG:2264
+          ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
+
+      - name: Trim fields (optional)
+        run: |
+          cd data
+          ogr2ogr -f GeoJSON parcel_sales_min.geojson parcel_sales.geojson \
+            -select pid,parcelid,streetnumber,streetname,city,zipcode,saledate,saleprice
+
+      - name: Prepare public folder
+        run: |
+          mkdir -p public
+          mv data/parcel_sales_min.geojson public/parcel_sales.geojson
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/parcel_sales.geojson
+          git commit -m "Auto-update parcel sales GeoJSON [skip ci]" || echo "No changes"
+          git push
