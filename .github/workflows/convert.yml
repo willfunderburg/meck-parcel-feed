@@ -2,8 +2,12 @@ name: Convert Meck Parcel Sales to GeoJSON
 
 on:
   schedule:
-    - cron: "15 10 * * 1"   # every Monday 10:15 UTC (adjust if needed)
+    - cron: "15 10 * * 1"   # every Monday 10:15 UTC
   workflow_dispatch:
+
+# Give this workflow permission to push commits
+permissions:
+  contents: write
 
 jobs:
   convert:
@@ -12,6 +16,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install GDAL
         run: |
@@ -38,14 +46,14 @@ jobs:
           set -e
           cd data
           SHP_FILE=$(ls *.shp | head -n1)
-          # Meck shapefiles are usually in EPSG:2264; reproject to 4326 for GeoJSON
+          # Meck shapefiles are typically EPSG:2264; reproject to WGS84
           ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
 
-      # Keep full attribute set to avoid field-name mismatches
       - name: Trim fields (optional)
         run: |
           set -e
           cd data
+          # Keep full attributes to avoid field-name mismatches
           cp parcel_sales.geojson parcel_sales_min.geojson
 
       - name: Prepare public folder
