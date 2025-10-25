@@ -1,11 +1,11 @@
-name: Convert Meck Parcel Sales to GeoJSON
+name: Convert Meck Parcel Sales to CSV (WGS84)
 
 on:
   schedule:
     - cron: "15 10 * * 1"   # every Monday 10:15 UTC
   workflow_dispatch:
 
-# Give this workflow permission to push commits
+# allow this workflow to push to the repo
 permissions:
   contents: write
 
@@ -41,32 +41,80 @@ jobs:
           cd data
           unzip -o Parcel_Sales.zip
 
-      - name: Convert to GeoJSON (reproject to WGS84)
+      - name: Detect layer name
+        id: layer
         run: |
           set -e
           cd data
-          SHP_FILE=$(ls *.shp | head -n1)
-          # Meck shapefiles are typically EPSG:2264; reproject to WGS84
+          # usually layer name == basename of .shp
+          LAYER=$(ls *.shp | head -n1 | sed 's/\.shp$//')
+          echo "layer=$LAYER" >> $GITHUB_OUTPUT
+
+      - name: Reproject to WGS84 GeoJSON (temporary)
+        run: |
+          set -e
+          cd data
+          SHP_FILE="${{ steps.layer.outputs.layer }}.shp"
+          # Mecklenburg data is typically EPSG:2264; convert to 4326 (WGS84)
           ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
 
-      - name: Trim fields (optional)
+      - name: Export minimal CSV with lon/lat
         run: |
           set -e
           cd data
-          # Keep full attributes to avoid field-name mismatches
-          cp parcel_sales.geojson parcel_sales_min.geojson
+          # Export to CSV, include geometry as X,Y columns
+          # Use a tolerant SELECT that works whether fields are named saleprice vs amt_Price, saledate vs dte_DateofSale, etc.
+          ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
+            -lco GEOMETRY=AS_XY \
+            -dialect SQLite \
+            -sql "
+              SELECT
+                X(geometry) AS lon,
+                Y(geometry) AS lat,
+                COALESCE(pid, parcelid, taxpid, commonpid)         AS pid,
+                parcelid,
+                streetnumber,
+                streetname,
+                city,
+                zipcode,
+                COALESCE(saledate, dte_DateofSale)                 AS saledate,
+                COALESCE(saleprice, amt_Price)                     AS saleprice
+              FROM 'parcel_sales'
+            " || true
 
-      - name: Prepare public folder
+          # If the layer name isn't 'parcel_sales', fall back to real layer name
+          if [ ! -s parcel_sales.csv ]; then
+            LAYER="${{ steps.layer.outputs.layer }}"
+            ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
+              -lco GEOMETRY=AS_XY \
+              -dialect SQLite \
+              -sql "
+                SELECT
+                  X(geometry) AS lon,
+                  Y(geometry) AS lat,
+                  COALESCE(pid, parcelid, taxpid, commonpid)       AS pid,
+                  parcelid,
+                  streetnumber,
+                  streetname,
+                  city,
+                  zipcode,
+                  COALESCE(saledate, dte_DateofSale)               AS saledate,
+                  COALESCE(saleprice, amt_Price)                   AS saleprice
+                FROM '${LAYER}'
+              "
+          fi
+
+      - name: Prepare public folder (CSV only)
         run: |
           set -e
           mkdir -p public
-          mv data/parcel_sales_min.geojson public/parcel_sales.geojson
+          mv data/parcel_sales.csv public/parcel_sales.csv
 
       - name: Commit and push
         run: |
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add public/parcel_sales.geojson
-          git commit -m "Auto-update parcel sales GeoJSON [skip ci]" || echo "No changes to commit"
+          git add public/parcel_sales.csv
+          git commit -m "Auto-update parcel sales CSV (lon/lat, attrs) [skip ci]" || echo "No changes to commit"
           git push
