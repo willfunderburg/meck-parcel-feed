@@ -38,10 +38,10 @@ jobs:
           ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
 
       - name: Trim fields (optional)
-        run: |
-          cd data
-          ogr2ogr -f GeoJSON parcel_sales_min.geojson parcel_sales.geojson \
-            -select pid,parcelid,streetnumber,streetname,city,zipcode,saledate,saleprice
+  run: |
+    cd data
+    # Keep full attribute set to avoid field-name mismatches
+    cp parcel_sales.geojson parcel_sales_min.geojson
 
       - name: Prepare public folder
         run: |
