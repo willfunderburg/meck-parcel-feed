@@ -5,7 +5,6 @@ on:
     - cron: "15 10 * * 1"   # every Monday 10:15 UTC
   workflow_dispatch:
 
-# allow this workflow to push to the repo
 permissions:
   contents: write
 
@@ -26,7 +25,7 @@ jobs:
           set -e
           sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
           sudo apt-get update -y
-          sudo apt-get install -y gdal-bin unzip curl
+          sudo apt-get install -y gdal-bin unzip curl jq
 
       - name: Download shapefile zip
         run: |
@@ -46,7 +45,6 @@ jobs:
         run: |
           set -e
           cd data
-          # usually layer name == basename of .shp
           LAYER=$(ls *.shp | head -n1 | sed 's/\.shp$//')
           echo "layer=$LAYER" >> $GITHUB_OUTPUT
 
@@ -54,55 +52,62 @@ jobs:
         run: |
           set -e
           cd data
-          SHP_FILE="${{ steps.layer.outputs.layer }}.shp"
-          # Mecklenburg data is typically EPSG:2264; convert to 4326 (WGS84)
-          ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
+          SHP="${{ steps.layer.outputs.layer }}.shp"
+          ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP"
 
-      - name: Export minimal CSV with lon/lat
+      - name: Export minimal CSV with lon/lat (robust field detection)
         run: |
           set -e
           cd data
-          # Export to CSV, include geometry as X,Y columns
-          # Use a tolerant SELECT that works whether fields are named saleprice vs amt_Price, saledate vs dte_DateofSale, etc.
+
+          # List fields from the GeoJSON layer (case-sensitive names)
+          LAYER=$(
+            ogrinfo -ro -so -al parcel_sales.geojson | awk -F': ' '/^Layer name:/{print $2; exit}'
+          )
+          FIELDS=$(
+            ogrinfo -ro -so -al parcel_sales.geojson | awk '/^Field:/{print $2}'
+          )
+
+          # Helper: find a field by case-insensitive name from a list of candidates
+          find_field () {
+            for want in "$@"; do
+              for f in $FIELDS; do
+                if [ "$(echo "$f"    | tr '[:upper:]' '[:lower:]')" = \
+                     "$(echo "$want" | tr '[:upper:]' '[:lower:]')" ]; then
+                  echo "$f"; return 0
+                fi
+              done
+            done
+            return 1
+          }
+
+          PID=$(find_field pid parcelid taxpid commonpid id_Common_Pid)
+          PARCELID=$(find_field parcelid)
+          STNUM=$(find_field streetnumber)
+          STNAME=$(find_field streetname address)
+          CITY=$(find_field city)
+          ZIP=$(find_field zipcode zip)
+          DATEF=$(find_field saledate dte_DateofSale dte_dateofsale)
+          PRICEF=$(find_field saleprice amt_Price price)
+
+          # Build SELECT list safely, quoting identifiers
+          SEL='X(geometry) AS lon, Y(geometry) AS lat'
+          [ -n "$PID" ]      && SEL="$SEL, \"$PID\" AS pid"
+          [ -n "$PARCELID" ] && SEL="$SEL, \"$PARCELID\" AS parcelid"
+          [ -n "$STNUM" ]    && SEL="$SEL, \"$STNUM\" AS streetnumber"
+          [ -n "$STNAME" ]   && SEL="$SEL, \"$STNAME\" AS streetname"
+          [ -n "$CITY" ]     && SEL="$SEL, \"$CITY\" AS city"
+          [ -n "$ZIP" ]      && SEL="$SEL, \"$ZIP\" AS zipcode"
+          [ -n "$DATEF" ]    && SEL="$SEL, \"$DATEF\" AS saledate"
+          [ -n "$PRICEF" ]   && SEL="$SEL, \"$PRICEF\" AS saleprice"
+
+          echo "Using SELECT: $SEL"
+
+          # Export to CSV with lon/lat columns; only the fields that exist are referenced
           ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
             -lco GEOMETRY=AS_XY \
             -dialect SQLite \
-            -sql "
-              SELECT
-                X(geometry) AS lon,
-                Y(geometry) AS lat,
-                COALESCE(pid, parcelid, taxpid, commonpid)         AS pid,
-                parcelid,
-                streetnumber,
-                streetname,
-                city,
-                zipcode,
-                COALESCE(saledate, dte_DateofSale)                 AS saledate,
-                COALESCE(saleprice, amt_Price)                     AS saleprice
-              FROM 'parcel_sales'
-            " || true
-
-          # If the layer name isn't 'parcel_sales', fall back to real layer name
-          if [ ! -s parcel_sales.csv ]; then
-            LAYER="${{ steps.layer.outputs.layer }}"
-            ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
-              -lco GEOMETRY=AS_XY \
-              -dialect SQLite \
-              -sql "
-                SELECT
-                  X(geometry) AS lon,
-                  Y(geometry) AS lat,
-                  COALESCE(pid, parcelid, taxpid, commonpid)       AS pid,
-                  parcelid,
-                  streetnumber,
-                  streetname,
-                  city,
-                  zipcode,
-                  COALESCE(saledate, dte_DateofSale)               AS saledate,
-                  COALESCE(saleprice, amt_Price)                   AS saleprice
-                FROM '${LAYER}'
-              "
-          fi
+            -sql "SELECT $SEL FROM '$LAYER'"
 
       - name: Prepare public folder (CSV only)
         run: |
