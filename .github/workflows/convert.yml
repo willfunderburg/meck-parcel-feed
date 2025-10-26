@@ -46,51 +46,71 @@ jobs:
           set -e
           cd data
           LAYER=$(ls *.shp | head -n1 | sed 's/\.shp$//')
+          echo "Layer detected: $LAYER"
           echo "layer=$LAYER" >> $GITHUB_OUTPUT
 
       - name: Reproject to WGS84 GeoJSON (temporary)
         run: |
-          set -e
+          set -ex
           cd data
           SHP="${{ steps.layer.outputs.layer }}.shp"
+          # Meck data is typically EPSG:2264; convert to WGS84
           ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP"
+          # Show a summary and JSON schema (for debugging)
+          ogrinfo -ro -so -al parcel_sales.geojson || true
+          ogrinfo -ro -so -al -json parcel_sales.geojson > meta.json || true
+          head -c 400 meta.json || true
+          echo
 
       - name: Export minimal CSV with lon/lat (robust field detection)
         run: |
-          set -e
+          set -ex
           cd data
 
-          # List fields from the GeoJSON layer (case-sensitive names)
-          LAYER=$(
-            ogrinfo -ro -so -al parcel_sales.geojson | awk -F': ' '/^Layer name:/{print $2; exit}'
-          )
-          FIELDS=$(
-            ogrinfo -ro -so -al parcel_sales.geojson | awk '/^Field:/{print $2}'
-          )
+          # Read schema in JSON to get layer name and field list
+          # If the previous step didn't write meta.json, create it now.
+          if [ ! -s meta.json ]; then
+            ogrinfo -ro -so -al -json parcel_sales.geojson > meta.json
+          fi
 
-          # Helper: find a field by case-insensitive name from a list of candidates
+          # Layer name from JSON (fallback to detected .shp base if missing)
+          LAYER=$(jq -r '.layers[0].name // empty' meta.json)
+          if [ -z "$LAYER" ]; then
+            LAYER="${{ steps.layer.outputs.layer }}"
+          fi
+          echo "Using layer: $LAYER"
+
+          # Collect field names exactly as they appear (case sensitive)
+          jq -r '.layers[0].fields[]?.name' meta.json > fields.txt || true
+          echo "Fields detected:"
+          cat fields.txt || true
+
+          # Helper: finds the first existing field from a list of candidates (case-insensitive)
           find_field () {
+            # Build lowercase candidate set from fields.txt
+            awk '{print tolower($0)":"$0}' fields.txt 2>/dev/null > fields_map.txt || true
             for want in "$@"; do
-              for f in $FIELDS; do
-                if [ "$(echo "$f"    | tr '[:upper:]' '[:lower:]')" = \
-                     "$(echo "$want" | tr '[:upper:]' '[:lower:]')" ]; then
-                  echo "$f"; return 0
-                fi
-              done
+              lwant=$(printf "%s" "$want" | tr '[:upper:]' '[:lower:]')
+              # search mapping for lwant:
+              match=$(awk -F: -v t="$lwant" '$1==t {print $2; exit}' fields_map.txt 2>/dev/null || true)
+              if [ -n "$match" ]; then
+                echo "$match"
+                return 0
+              fi
             done
             return 1
           }
 
           PID=$(find_field pid parcelid taxpid commonpid id_Common_Pid)
           PARCELID=$(find_field parcelid)
-          STNUM=$(find_field streetnumber)
-          STNAME=$(find_field streetname address)
-          CITY=$(find_field city)
+          STNUM=$(find_field streetnumber stnumber housenum housenumber)
+          STNAME=$(find_field streetname stname address addr)
+          CITY=$(find_field city loccity)
           ZIP=$(find_field zipcode zip)
-          DATEF=$(find_field saledate dte_DateofSale dte_dateofsale)
+          DATEF=$(find_field saledate dte_DateofSale dte_dateofsale dateofsale)
           PRICEF=$(find_field saleprice amt_Price price)
 
-          # Build SELECT list safely, quoting identifiers
+          # Build SELECT safely with only existing fields
           SEL='X(geometry) AS lon, Y(geometry) AS lat'
           [ -n "$PID" ]      && SEL="$SEL, \"$PID\" AS pid"
           [ -n "$PARCELID" ] && SEL="$SEL, \"$PARCELID\" AS parcelid"
@@ -101,13 +121,18 @@ jobs:
           [ -n "$DATEF" ]    && SEL="$SEL, \"$DATEF\" AS saledate"
           [ -n "$PRICEF" ]   && SEL="$SEL, \"$PRICEF\" AS saleprice"
 
-          echo "Using SELECT: $SEL"
+          echo "SELECT clause:"
+          echo "$SEL"
 
-          # Export to CSV with lon/lat columns; only the fields that exist are referenced
+          # If somehow we only have lon/lat, still export that
           ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
             -lco GEOMETRY=AS_XY \
             -dialect SQLite \
             -sql "SELECT $SEL FROM '$LAYER'"
+
+          # Show a preview for debugging
+          head -n 5 parcel_sales.csv || true
+          wc -l parcel_sales.csv || true
 
       - name: Prepare public folder (CSV only)
         run: |
