@@ -18,6 +18,7 @@ jobs:
 
       - name: Install GDAL
         run: |
+          set -e
           sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
           sudo apt-get update -y
           sudo apt-get install -y gdal-bin unzip curl jq
@@ -40,45 +41,43 @@ jobs:
           set -e
           cd data
           SHP_FILE=$(ls *.shp | head -n 1)
-          # Meck data is EPSG:2264 (NAD83 / NCft), convert to 4326
+          # Meck data is EPSG:2264 (NAD83 / NCft); convert to 4326
           ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
 
-      - name: Export minimal CSV with lon/lat (latest per parcel, last 12 months, with address)
+      - name: Export CSV (latest per parcel, last 12 months, with address)
         run: |
           set -e
           cd data
 
-          # Detect layer name in the GeoJSON
-          LAYER=$(ogrinfo -ro -so parcel_sales.geojson | awk 'NR==1{print $3}')
+          # Detect the layer name (second line of ogrinfo output is usually "1: <LayerName>")
+          LAYER=$(ogrinfo -ro -so parcel_sales.geojson | awk 'NR==2{print $2}')
 
-          # Build the CSV using SQLite dialect and window functions
-          ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
-            -dialect SQLite \
-            -sql "
+          # Compose SQL as a single string and pass to ogr2ogr
+          SQL=$(cat <<SQL
 WITH base AS (
   SELECT
     -- WGS84 coordinates (already 4326 above)
     CAST(ST_X(geometry) AS REAL) AS lon,
     CAST(ST_Y(geometry) AS REAL) AS lat,
 
-    -- Pick a parcel identifier
+    -- Parcel identifiers (pick first non-null)
     COALESCE(pid, parcelid, taxpid, commonpid, id_Common_Pid) AS pid,
     parcelid,
 
-    -- Address assembly (adjust if field names differ)
+    -- Address assembly (adjust field names if needed)
     TRIM(COALESCE(streetnumber, housenumber, stnumber, '')) || ' ' ||
     TRIM(COALESCE(streetname, '')) AS address,
 
     COALESCE(city, loccity) AS city,
     zipcode,
 
-    -- Sale date/price normalization (support multiple field names)
+    -- Sale date / price normalization
     COALESCE(saledate, dte_DateofSale) AS saledate_raw,
     CAST(REPLACE(COALESCE(saleprice, amt_Price), ',', '') AS REAL) AS saleprice,
 
-    -- Normalize date to YYYY-MM-DD
+    -- Normalize date to YYYY-MM-DD (handles YYYY/MM/DD and YYYY-MM-DD)
     DATE(REPLACE(COALESCE(saledate, dte_DateofSale), '/', '-')) AS d
-  FROM \"$LAYER\"
+  FROM "$LAYER"
 ),
 recent AS (
   SELECT *,
@@ -86,13 +85,19 @@ recent AS (
   FROM base
   WHERE d IS NOT NULL
 )
-SELECT lon, lat, pid, parcelid, address, city, zipcode,
-       d AS saledate, saleprice
+SELECT
+  lon, lat, pid, parcelid, address, city, zipcode,
+  d AS saledate, saleprice
 FROM recent
-WHERE rn = 1                       -- latest sale per parcel
-  AND d >= DATE('now','-12 months')
+WHERE rn = 1                        -- most recent sale per parcel
+  AND d >= DATE('now','-12 months') -- last 12 months
 ORDER BY d DESC;
-            "
+SQL
+)
+
+          ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
+            -dialect SQLite \
+            -sql "$SQL"
 
       - name: Prepare public folder (CSV only)
         run: |
