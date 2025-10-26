@@ -1,115 +1,102 @@
-name: Convert Meck Parcel Sales to CSV (WGS84)
+name: Build parcel sales CSV (weekly)
 
 on:
   schedule:
-    - cron: "15 10 * * 1"   # every Monday 10:15 UTC
+    - cron: "15 10 * * 1"   # Mondays 10:15 UTC
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  convert:
+  build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install GDAL
         run: |
-          set -e
-          sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
-          sudo apt-get update -y
-          sudo apt-get install -y gdal-bin unzip curl jq
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin sqlite3 zip unzip
 
-      - name: Download shapefile zip
+      - name: Download and unzip shapefile
         run: |
-          set -e
-          mkdir -p data
-          cd data
-          curl -fL -o Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
+          set -euo pipefail
+          mkdir -p data/shp public
+          curl -fL -o data/Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
+          unzip -o data/Parcel_Sales.zip -d data/shp
 
-      - name: Unzip shapefile
+      - name: Reproject to WGS84 GeoPackage
         run: |
-          set -e
-          cd data
-          unzip -o Parcel_Sales.zip
+          set -euo pipefail
+          SHP_FILE=$(ls data/shp/*.shp | head -n 1)
+          ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326
+          # capture layer name (usually "1: <LayerName>")
+          LAYER=$(ogrinfo -ro -so data/sales.gpkg | awk -F': ' '/1: /{print $2; exit}')
+          echo "Detected layer: $LAYER"
+          echo "$LAYER" > data/layer.txt
 
-      - name: Reproject to WGS84 GeoJSON (temporary)
+      - name: Build latest-per-parcel (last 12 months) CSV
         run: |
-          set -e
-          cd data
-          SHP_FILE=$(ls *.shp | head -n 1)
-          # Meck data is EPSG:2264 (NAD83 / NCft); convert to 4326
-          ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
+          set -euo pipefail
+          LAYER=$(cat data/layer.txt)
 
-      - name: Export CSV (latest per parcel, last 12 months, with address)
-        run: |
-          set -e
-          cd data
+          # Write SQL safely with a quoted heredoc so neither YAML nor Bash expands it
+          cat > data/query.sql <<'SQL'
+          WITH recent AS (
+            SELECT
+              geometry,
+              pid,
+              parcelid,
+              address,
+              city,
+              zipcode,
+              saleprice,
+              -- normalize to YYYY-MM-DD; keep original if already in that format
+              substr(saledate,1,10) AS saledate_norm
+            FROM "{LAYER}"
+            WHERE date(substr(saledate,1,10)) >= date('now','-12 months')
+          ),
+          ranked AS (
+            SELECT
+              CAST(ST_X(ST_Centroid(geometry)) AS REAL) AS lon,
+              CAST(ST_Y(ST_Centroid(geometry)) AS REAL) AS lat,
+              pid,
+              parcelid,
+              address,
+              city,
+              zipcode,
+              saledate_norm AS saledate,
+              saleprice,
+              ROW_NUMBER() OVER (
+                PARTITION BY parcelid
+                ORDER BY date(saledate_norm) DESC
+              ) AS rn
+            FROM recent
+          )
+          SELECT
+            lon, lat, pid, parcelid, address, city, zipcode, saledate, saleprice
+          FROM ranked
+          WHERE rn = 1
+          ORDER BY date(saledate) DESC;
+          SQL
 
-          # Detect the layer name (second line of ogrinfo output is usually "1: <LayerName>")
-          LAYER=$(ogrinfo -ro -so parcel_sales.geojson | awk 'NR==2{print $2}')
+          # Inject the real layer name into the SQL file
+          sed -i "s/{LAYER}/$LAYER/g" data/query.sql
 
-          # Compose SQL as a single string and pass to ogr2ogr
-          SQL=$(cat <<SQL
-WITH base AS (
-  SELECT
-    -- WGS84 coordinates (already 4326 above)
-    CAST(ST_X(geometry) AS REAL) AS lon,
-    CAST(ST_Y(geometry) AS REAL) AS lat,
-
-    -- Parcel identifiers (pick first non-null)
-    COALESCE(pid, parcelid, taxpid, commonpid, id_Common_Pid) AS pid,
-    parcelid,
-
-    -- Address assembly (adjust field names if needed)
-    TRIM(COALESCE(streetnumber, housenumber, stnumber, '')) || ' ' ||
-    TRIM(COALESCE(streetname, '')) AS address,
-
-    COALESCE(city, loccity) AS city,
-    zipcode,
-
-    -- Sale date / price normalization
-    COALESCE(saledate, dte_DateofSale) AS saledate_raw,
-    CAST(REPLACE(COALESCE(saleprice, amt_Price), ',', '') AS REAL) AS saleprice,
-
-    -- Normalize date to YYYY-MM-DD (handles YYYY/MM/DD and YYYY-MM-DD)
-    DATE(REPLACE(COALESCE(saledate, dte_DateofSale), '/', '-')) AS d
-  FROM "$LAYER"
-),
-recent AS (
-  SELECT *,
-         ROW_NUMBER() OVER (PARTITION BY pid ORDER BY d DESC) AS rn
-  FROM base
-  WHERE d IS NOT NULL
-)
-SELECT
-  lon, lat, pid, parcelid, address, city, zipcode,
-  d AS saledate, saleprice
-FROM recent
-WHERE rn = 1                        -- most recent sale per parcel
-  AND d >= DATE('now','-12 months') -- last 12 months
-ORDER BY d DESC;
-SQL
-)
-
-          ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
+          # Run the SQL via OGR’s SQLite dialect
+          ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
-            -sql "$SQL"
+            -sql "$(cat data/query.sql)"
 
-      - name: Prepare public folder (CSV only)
+      - name: Commit CSV
         run: |
-          set -e
-          mkdir -p public
-          mv -f data/parcel_sales.csv public/parcel_sales.csv
-
-      - name: Commit and push
-        run: |
-          set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add public/parcel_sales.csv
-          git commit -m "Auto-update parcel sales CSV (latest per parcel, last 12 months) [skip ci]" || echo "No changes to commit."
-          git push
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain public/parcel_sales.csv)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add public/parcel_sales.csv
+            git commit -m "Update parcel_sales.csv [weekly]"
+            git push
+          else
+            echo "No changes this run."
+          fi
