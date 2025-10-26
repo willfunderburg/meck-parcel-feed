@@ -54,14 +54,12 @@ jobs:
           set -ex
           cd data
           SHP="${{ steps.layer.outputs.layer }}.shp"
-          # Mecklenburg sales are typically EPSG:2264; reproject to WGS84 (EPSG:4326)
           ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP"
-          # Save schema as JSON for robust field detection
           ogrinfo -ro -so -al -json parcel_sales.geojson > meta.json
           head -c 400 meta.json || true
           echo
 
-      - name: Export minimal CSV with lon/lat (no SQL; robust field detection)
+      - name: Export minimal CSV with lon/lat (no SQL; robust + non-failing finder)
         run: |
           set -ex
           cd data
@@ -76,21 +74,24 @@ jobs:
           jq -r '.layers[0].fields[]?.name' meta.json > fields.txt || true
           echo "Fields detected:"; cat fields.txt || true
 
-          # helper to find first existing field from candidates (case-insensitive)
+          # Non-failing finder: echoes match or empty, ALWAYS returns 0
           find_field () {
             awk '{print tolower($0)":"$0}' fields.txt 2>/dev/null > fields_map.txt || true
             for want in "$@"; do
               lwant=$(printf "%s" "$want" | tr '[:upper:]' '[:lower:]')
               match=$(awk -F: -v t="$lwant" '$1==t {print $2; exit}' fields_map.txt 2>/dev/null || true)
               if [ -n "$match" ]; then
-                echo "$match"; return 0
+                echo "$match"
+                echo "" > /dev/null  # keep exit 0
+                return 0
               fi
             done
-            return 1
+            echo ""   # no match; still exit 0 so set -e doesn't kill us
+            return 0
           }
 
           PID=$(find_field pid parcelid taxpid commonpid id_Common_Pid)
-          PARCELID=$(find_field parcelid)
+          PARCELID=$(find_field parcelid propertyid)
           STNUM=$(find_field streetnumber stnumber housenum housenumber)
           STNAME=$(find_field streetname stname address addr)
           CITY=$(find_field city loccity)
@@ -108,20 +109,29 @@ jobs:
           [ -n "$ZIP" ]      && SEL="${SEL:+$SEL,}$ZIP"
           [ -n "$DATEF" ]    && SEL="${SEL:+$SEL,}$DATEF"
           [ -n "$PRICEF" ]   && SEL="${SEL:+$SEL,}$PRICEF"
-
           echo "Select list: ${SEL:-<none>}"
-          # Export to CSV and let the CSV driver add X,Y columns via GEOMETRY=AS_XY
+
           if [ -n "$SEL" ]; then
-            ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
+            ogr2ogr -f CSV parcel_sales_raw.csv parcel_sales.geojson \
               -nln "$LAYER" \
               -lco GEOMETRY=AS_XY \
               -select "$SEL"
           else
-            # no attributes matched; still export with just lon/lat
-            ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
+            # no attributes matched; still export with just X,Y
+            ogr2ogr -f CSV parcel_sales_raw.csv parcel_sales.geojson \
               -nln "$LAYER" \
               -lco GEOMETRY=AS_XY
           fi
+
+          # Rename header X,Y to lon,lat for downstream consistency
+          read -r HEADER < parcel_sales_raw.csv
+          echo "Raw header: $HEADER"
+          printf '%s\n' "$HEADER" | awk 'NR==1{gsub(/^X,Y,/, "lon,lat,"); gsub(/^X,Y$/, "lon,lat"); print}' > header.tmp
+          NEWHEADER=$(cat header.tmp)
+          tail -n +2 parcel_sales_raw.csv > body.tmp
+          printf '%s\n' "$NEWHEADER" > parcel_sales.csv
+          cat body.tmp >> parcel_sales.csv
+          rm -f header.tmp body.tmp parcel_sales_raw.csv
 
           echo "CSV preview:"
           head -n 5 parcel_sales.csv || true
