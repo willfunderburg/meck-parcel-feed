@@ -5,6 +5,9 @@ on:
     - cron: "15 10 * * 1"   # Mondays 10:15 UTC
   workflow_dispatch:
 
+permissions:
+  contents: write  # allow GITHUB_TOKEN to push
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,40 +19,61 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y gdal-bin sqlite3 zip unzip
+          sudo apt-get install -y gdal-bin sqlite3 zip unzip curl
 
-      - name: Download and unzip shapefile
+      - name: Download and unzip Parcel_Sales
         run: |
           set -euo pipefail
           mkdir -p data/shp public
           curl -fL -o data/Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
           unzip -o data/Parcel_Sales.zip -d data/shp
 
-      - name: Reproject to WGS84 GeoPackage (layer name = 'sales')
+      - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
-          # Force the target layer name so later SQL is stable
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
-      - name: Inspect layer fields
-        run: |
-          ogrinfo -ro -so -al data/sales.gpkg sales
-          
-      - name: Build latest-per-parcel (last 12 months) CSV
+      - name: Download and load MAT (Master Address Table) as 'mat'
         run: |
           set -euo pipefail
+          mkdir -p data/mat
+          curl -fL -o data/MAT.zip "https://maps.mecknc.gov/opendata/MAT.zip"
+          unzip -o data/MAT.zip -d data/mat
+          MAT_SHP=$(ls data/mat/*.shp | head -n 1)
+          ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -overwrite
+
+      - name: Inspect MAT fields (for troubleshooting)
+        run: |
+          ogrinfo -ro -so -al data/sales.gpkg mat
+
+      - name: Build latest-per-parcel (last 12 months) CSV with address
+        run: |
+          set -euo pipefail
+          # NOTE: If MAT field names differ, edit the three column names below:
+          #   address -> siteaddre
+          #   city    -> city
+          #   zipcode -> zipcode
           cat > data/query.sql <<'SQL'
           WITH recent AS (
             SELECT
-              geom,
-              parcelid,
-              propertyid AS pid,
-              transferid,
-              saleprice,
-              saledate
-            FROM sales
-            WHERE date(saledate) >= date('now','-12 months')
+              s.geom,
+              s.parcelid,
+              s.propertyid AS pid,
+              s.saleprice,
+              s.saledate
+            FROM sales s
+            WHERE date(s.saledate) >= date('now','-12 months')
+          ),
+          joined AS (
+            SELECT
+              r.*,
+              COALESCE(m.siteaddre, '') AS address,
+              COALESCE(m.city, '')      AS city,
+              COALESCE(m.zipcode, '')   AS zipcode
+            FROM recent r
+            LEFT JOIN mat m
+              ON r.parcelid = m.parcelid
           ),
           ranked AS (
             SELECT
@@ -57,16 +81,16 @@ jobs:
               CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
               pid,
               parcelid,
-              '' AS address,         -- not present in source
-              '' AS city,            -- not present in source
-              '' AS zipcode,         -- not present in source
+              address,
+              city,
+              zipcode,
               strftime('%Y-%m-%d', saledate) AS saledate,
               saleprice,
               ROW_NUMBER() OVER (
                 PARTITION BY parcelid
                 ORDER BY date(saledate) DESC
               ) AS rn
-            FROM recent
+            FROM joined
           )
           SELECT
             lon, lat, pid, parcelid, address, city, zipcode, saledate, saleprice
