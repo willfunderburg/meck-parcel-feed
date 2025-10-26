@@ -15,14 +15,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install GDAL
         run: |
-          set -e
           sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
           sudo apt-get update -y
           sudo apt-get install -y gdal-bin unzip curl jq
@@ -40,114 +35,76 @@ jobs:
           cd data
           unzip -o Parcel_Sales.zip
 
-      - name: Detect layer name
-        id: layer
+      - name: Reproject to WGS84 GeoJSON (temporary)
         run: |
           set -e
           cd data
-          LAYER=$(ls *.shp | head -n1 | sed 's/\.shp$//')
-          echo "Layer detected: $LAYER"
-          echo "layer=$LAYER" >> $GITHUB_OUTPUT
+          SHP_FILE=$(ls *.shp | head -n 1)
+          # Meck data is EPSG:2264 (NAD83 / NCft), convert to 4326
+          ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP_FILE"
 
-      - name: Reproject to WGS84 GeoJSON (temporary)
+      - name: Export minimal CSV with lon/lat (latest per parcel, last 12 months, with address)
         run: |
-          set -ex
-          cd data
-          SHP="${{ steps.layer.outputs.layer }}.shp"
-          ogr2ogr -f GeoJSON -s_srs EPSG:2264 -t_srs EPSG:4326 parcel_sales.geojson "$SHP"
-          ogrinfo -ro -so -al -json parcel_sales.geojson > meta.json
-          head -c 400 meta.json || true
-          echo
-
-      - name: Export minimal CSV with lon/lat (no SQL; robust + non-failing finder)
-        run: |
-          set -ex
+          set -e
           cd data
 
-          # Parse layer + fields from meta.json
-          LAYER=$(jq -r '.layers[0].name // empty' meta.json)
-          if [ -z "$LAYER" ]; then
-            LAYER="${{ steps.layer.outputs.layer }}"
-          fi
-          echo "Using layer: $LAYER"
+          # Detect layer name in the GeoJSON
+          LAYER=$(ogrinfo -ro -so parcel_sales.geojson | awk 'NR==1{print $3}')
 
-          jq -r '.layers[0].fields[]?.name' meta.json > fields.txt || true
-          echo "Fields detected:"; cat fields.txt || true
+          # Build the CSV using SQLite dialect and window functions
+          ogr2ogr -f CSV parcel_sales.csv parcel_sales.geojson \
+            -dialect SQLite \
+            -sql "
+WITH base AS (
+  SELECT
+    -- WGS84 coordinates (already 4326 above)
+    CAST(ST_X(geometry) AS REAL) AS lon,
+    CAST(ST_Y(geometry) AS REAL) AS lat,
 
-          # Non-failing finder: echoes match or empty, ALWAYS returns 0
-          find_field () {
-            awk '{print tolower($0)":"$0}' fields.txt 2>/dev/null > fields_map.txt || true
-            for want in "$@"; do
-              lwant=$(printf "%s" "$want" | tr '[:upper:]' '[:lower:]')
-              match=$(awk -F: -v t="$lwant" '$1==t {print $2; exit}' fields_map.txt 2>/dev/null || true)
-              if [ -n "$match" ]; then
-                echo "$match"
-                echo "" > /dev/null  # keep exit 0
-                return 0
-              fi
-            done
-            echo ""   # no match; still exit 0 so set -e doesn't kill us
-            return 0
-          }
+    -- Pick a parcel identifier
+    COALESCE(pid, parcelid, taxpid, commonpid, id_Common_Pid) AS pid,
+    parcelid,
 
-          PID=$(find_field pid parcelid taxpid commonpid id_Common_Pid)
-          PARCELID=$(find_field parcelid propertyid)
-          STNUM=$(find_field streetnumber stnumber housenum housenumber)
-          STNAME=$(find_field streetname stname address addr)
-          CITY=$(find_field city loccity)
-          ZIP=$(find_field zipcode zip)
-          DATEF=$(find_field saledate dte_DateofSale dte_dateofsale dateofsale)
-          PRICEF=$(find_field saleprice amt_Price price)
+    -- Address assembly (adjust if field names differ)
+    TRIM(COALESCE(streetnumber, housenumber, stnumber, '')) || ' ' ||
+    TRIM(COALESCE(streetname, '')) AS address,
 
-          # Build a -select list only with fields that exist (no geometry here)
-          SEL=""
-          [ -n "$PID" ]      && SEL="${SEL:+$SEL,}$PID"
-          [ -n "$PARCELID" ] && SEL="${SEL:+$SEL,}$PARCELID"
-          [ -n "$STNUM" ]    && SEL="${SEL:+$SEL,}$STNUM"
-          [ -n "$STNAME" ]   && SEL="${SEL:+$SEL,}$STNAME"
-          [ -n "$CITY" ]     && SEL="${SEL:+$SEL,}$CITY"
-          [ -n "$ZIP" ]      && SEL="${SEL:+$SEL,}$ZIP"
-          [ -n "$DATEF" ]    && SEL="${SEL:+$SEL,}$DATEF"
-          [ -n "$PRICEF" ]   && SEL="${SEL:+$SEL,}$PRICEF"
-          echo "Select list: ${SEL:-<none>}"
+    COALESCE(city, loccity) AS city,
+    zipcode,
 
-          if [ -n "$SEL" ]; then
-            ogr2ogr -f CSV parcel_sales_raw.csv parcel_sales.geojson \
-              -nln "$LAYER" \
-              -lco GEOMETRY=AS_XY \
-              -select "$SEL"
-          else
-            # no attributes matched; still export with just X,Y
-            ogr2ogr -f CSV parcel_sales_raw.csv parcel_sales.geojson \
-              -nln "$LAYER" \
-              -lco GEOMETRY=AS_XY
-          fi
+    -- Sale date/price normalization (support multiple field names)
+    COALESCE(saledate, dte_DateofSale) AS saledate_raw,
+    CAST(REPLACE(COALESCE(saleprice, amt_Price), ',', '') AS REAL) AS saleprice,
 
-          # Rename header X,Y to lon,lat for downstream consistency
-          read -r HEADER < parcel_sales_raw.csv
-          echo "Raw header: $HEADER"
-          printf '%s\n' "$HEADER" | awk 'NR==1{gsub(/^X,Y,/, "lon,lat,"); gsub(/^X,Y$/, "lon,lat"); print}' > header.tmp
-          NEWHEADER=$(cat header.tmp)
-          tail -n +2 parcel_sales_raw.csv > body.tmp
-          printf '%s\n' "$NEWHEADER" > parcel_sales.csv
-          cat body.tmp >> parcel_sales.csv
-          rm -f header.tmp body.tmp parcel_sales_raw.csv
-
-          echo "CSV preview:"
-          head -n 5 parcel_sales.csv || true
-          wc -l parcel_sales.csv || true
+    -- Normalize date to YYYY-MM-DD
+    DATE(REPLACE(COALESCE(saledate, dte_DateofSale), '/', '-')) AS d
+  FROM \"$LAYER\"
+),
+recent AS (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY pid ORDER BY d DESC) AS rn
+  FROM base
+  WHERE d IS NOT NULL
+)
+SELECT lon, lat, pid, parcelid, address, city, zipcode,
+       d AS saledate, saleprice
+FROM recent
+WHERE rn = 1                       -- latest sale per parcel
+  AND d >= DATE('now','-12 months')
+ORDER BY d DESC;
+            "
 
       - name: Prepare public folder (CSV only)
         run: |
           set -e
           mkdir -p public
-          mv data/parcel_sales.csv public/parcel_sales.csv
+          mv -f data/parcel_sales.csv public/parcel_sales.csv
 
       - name: Commit and push
         run: |
           set -e
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add public/parcel_sales.csv
-          git commit -m "Auto-update parcel sales CSV (lon/lat, attrs) [skip ci]" || echo "No changes to commit"
+          git commit -m "Auto-update parcel sales CSV (latest per parcel, last 12 months) [skip ci]" || echo "No changes to commit."
           git push
