@@ -32,6 +32,10 @@ jobs:
           # Force the target layer name so later SQL is stable
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
+      - name: Inspect layer fields
+        run: |
+          ogrinfo -ro -so -al data/sales.gpkg sales
+          
       - name: Build latest-per-parcel (last 12 months) CSV
         run: |
           set -euo pipefail
