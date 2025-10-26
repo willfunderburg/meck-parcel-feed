@@ -51,9 +51,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build spatial indexes to speed up ST_Intersects on GPKG
-          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')"
-          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"
+          # Create spatial indexes if missing; ignore "already exists" errors
+          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index already exists"
+          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index already exists"
 
           cat > data/query.sql <<'SQL'
           -- 1) Filter to last 12 months
@@ -84,12 +84,11 @@ jobs:
           ),
 
           -- 3) Spatial join to MAT points (address data)
-          -- Prefer full_addre, then address; pick one record per parcel
           mat_join AS (
             SELECT
               b.parcelid,
               COALESCE(m.full_addre, m.address, '')  AS address,
-              COALESCE(m.nme_city, m.nme_po_cit, '') AS city,
+              COALESCE(m.nme_city,  m.nme_po_cit, '') AS city,
               COALESCE(m.cde_zip1, '')               AS zipcode,
               ROW_NUMBER() OVER (
                 PARTITION BY b.parcelid
