@@ -42,31 +42,29 @@ jobs:
           cat > data/query.sql <<'SQL'
           WITH recent AS (
             SELECT
-              geometry,
-              pid,
+              geom,
               parcelid,
-              address,
-              city,
-              zipcode,
+              propertyid AS pid,
+              transferid,
               saleprice,
-              substr(saledate,1,10) AS saledate_norm
+              saledate
             FROM sales
-            WHERE date(substr(saledate,1,10)) >= date('now','-12 months')
+            WHERE date(saledate) >= date('now','-12 months')
           ),
           ranked AS (
             SELECT
-              CAST(ST_X(ST_Centroid(geometry)) AS REAL) AS lon,
-              CAST(ST_Y(ST_Centroid(geometry)) AS REAL) AS lat,
+              CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
+              CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
               pid,
               parcelid,
-              address,
-              city,
-              zipcode,
-              saledate_norm AS saledate,
+              '' AS address,         -- not present in source
+              '' AS city,            -- not present in source
+              '' AS zipcode,         -- not present in source
+              strftime('%Y-%m-%d', saledate) AS saledate,
               saleprice,
               ROW_NUMBER() OVER (
                 PARTITION BY parcelid
-                ORDER BY date(saledate_norm) DESC
+                ORDER BY date(saledate) DESC
               ) AS rn
             FROM recent
           )
