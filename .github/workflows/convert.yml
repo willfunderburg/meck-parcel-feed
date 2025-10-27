@@ -47,75 +47,118 @@ jobs:
         run: |
           ogrinfo -ro -so -al data/sales.gpkg mat
 
-      - name: Build latest-per-parcel (last 12 months) CSV with address (spatial join)
+      - name: Build latest-per-parcel (last 12 months) CSV — optimized (attr join + small spatial fallback + filters)
         run: |
           set -euo pipefail
 
-          # Create spatial indexes if missing; ignore "already exists" errors
-          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index already exists"
-          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index already exists"
+          # ---- SQLite perf knobs ----
+          ogrinfo data/sales.gpkg -sql "PRAGMA cache_size = 200000" >/dev/null 2>&1 || true
+          ogrinfo data/sales.gpkg -sql "PRAGMA temp_store = MEMORY"  >/dev/null 2>&1 || true
+          ogrinfo data/sales.gpkg -sql "PRAGMA synchronous = OFF"    >/dev/null 2>&1 || true
+          ogrinfo data/sales.gpkg -sql "PRAGMA journal_mode = OFF"   >/dev/null 2>&1 || true
 
+          # ---- Helpful indexes ----
+          ogrinfo data/sales.gpkg -sql "CREATE INDEX IF NOT EXISTS idx_sales_parcelid   ON sales(parcelid)"  || true
+          ogrinfo data/sales.gpkg -sql "CREATE INDEX IF NOT EXISTS idx_sales_propertyid ON sales(propertyid)" || true
+          ogrinfo data/sales.gpkg -sql "CREATE INDEX IF NOT EXISTS idx_mat_id_ncpin     ON mat(id_ncpin)"     || true
+          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index present"
+          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index present"
+
+          # ---- Query ----
           cat > data/query.sql <<'SQL'
-          -- 1) Filter to last 12 months
           WITH recent AS (
             SELECT
               s.geom,
               s.parcelid,
               s.propertyid AS pid,
+              printf('%010d', CAST(s.propertyid AS INTEGER)) AS pid_text,
               s.saleprice,
               s.saledate
             FROM sales s
             WHERE date(s.saledate) >= date('now','-12 months')
           ),
-
-          -- 2) Keep the latest sale per parcel
           latest AS (
             SELECT
-              geom, parcelid, pid, saleprice, saledate,
+              geom, parcelid, pid, pid_text, saleprice, saledate,
               ROW_NUMBER() OVER (
                 PARTITION BY parcelid
                 ORDER BY date(saledate) DESC
               ) AS rn
             FROM recent
           ),
+          base AS ( SELECT * FROM latest WHERE rn = 1 ),
 
-          base AS (
-            SELECT * FROM latest WHERE rn = 1
+          -- Attribute join by PIN
+          attr_join AS (
+            SELECT
+              b.parcelid, b.pid, b.pid_text, b.geom, b.saledate, b.saleprice,
+              COALESCE(m.full_addre, m.address, '')  AS address,
+              COALESCE(m.nme_city,  m.nme_po_cit, '') AS city,
+              COALESCE(m.cde_zip1, '')               AS zipcode
+            FROM base b
+            LEFT JOIN mat m
+              ON m.id_ncpin = b.pid_text
           ),
 
-          -- 3) Spatial join to MAT points (address data)
-          mat_join AS (
+          -- Spatial fallback: nearest MAT point to centroid within ~60 m
+          centroids AS (
+            SELECT parcelid, pid, pid_text, saleprice, saledate, ST_Centroid(geom) AS cgeom
+            FROM base
+          ),
+          spatial_fallback AS (
             SELECT
-              b.parcelid,
+              c.parcelid,
               COALESCE(m.full_addre, m.address, '')  AS address,
               COALESCE(m.nme_city,  m.nme_po_cit, '') AS city,
               COALESCE(m.cde_zip1, '')               AS zipcode,
-              ROW_NUMBER() OVER (
-                PARTITION BY b.parcelid
-                ORDER BY (m.full_addre IS NOT NULL) DESC,
-                         (m.address   IS NOT NULL) DESC
-              ) AS addr_rank
-            FROM base b
-            LEFT JOIN mat m
-              ON ST_Intersects(m.geom, b.geom)
+              Distance(c.cgeom, m.geom) AS dist
+            FROM centroids c
+            JOIN mat m
+            WHERE MbrIntersects(
+                    Envelope(c.cgeom),
+                    BuildMbr(ST_X(c.cgeom)-0.002, ST_Y(c.cgeom)-0.002,
+                             ST_X(c.cgeom)+0.002, ST_Y(c.cgeom)+0.002)
+                  )
+          ),
+          spatial_pick AS (
+            SELECT parcelid, address, city, zipcode
+            FROM (
+              SELECT parcelid, address, city, zipcode, dist,
+                     ROW_NUMBER() OVER (PARTITION BY parcelid ORDER BY dist ASC) AS rnk
+              FROM spatial_fallback
+              WHERE dist <= 0.00054
+            ) t
+            WHERE rnk = 1
+          ),
+
+          -- Merge: prefer attribute-join, else spatial
+          merged AS (
+            SELECT
+              a.pid, a.parcelid, a.geom, a.saledate, a.saleprice,
+              CASE WHEN a.address IS NOT NULL AND TRIM(a.address) <> ''
+                   THEN a.address ELSE COALESCE(sp.address,'') END AS address,
+              CASE WHEN a.address IS NOT NULL AND TRIM(a.address) <> ''
+                   THEN a.city    ELSE COALESCE(sp.city,'')    END AS city,
+              CASE WHEN a.address IS NOT NULL AND TRIM(a.address) <> ''
+                   THEN a.zipcode ELSE COALESCE(sp.zipcode,'') END AS zipcode
+            FROM attr_join a
+            LEFT JOIN spatial_pick sp ON sp.parcelid = a.parcelid
           )
 
-          -- 4) Final projection
           SELECT
-            CAST(ST_X(ST_Centroid(b.geom)) AS REAL) AS lon,
-            CAST(ST_Y(ST_Centroid(b.geom)) AS REAL) AS lat,
-            b.pid,
-            b.parcelid,
-            COALESCE(j.address, '')  AS address,
-            COALESCE(j.city, '')     AS city,
-            COALESCE(j.zipcode, '')  AS zipcode,
-            strftime('%Y-%m-%d', b.saledate) AS saledate,
-            b.saleprice
-          FROM base b
-          LEFT JOIN mat_join j
-            ON b.parcelid = j.parcelid
-           AND j.addr_rank = 1
-          ORDER BY date(b.saledate) DESC;
+            CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
+            CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
+            pid,
+            parcelid,
+            address,
+            city,
+            zipcode,
+            strftime('%Y-%m-%d', saledate) AS saledate,
+            saleprice
+          FROM merged
+          WHERE saleprice > 0
+            AND TRIM(COALESCE(address, '')) <> ''
+          ORDER BY date(saledate) DESC;
           SQL
 
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
