@@ -2,11 +2,11 @@ name: Build parcel sales CSV (weekly)
 
 on:
   schedule:
-    - cron: "0 5 * * 1"   # Runs at 1 AM ET during summer, 12 AM ET during winter
+    - cron: "0 5 * * 1"   # 01:00 ET summer / 00:00 ET winter
   workflow_dispatch:
 
 permissions:
-  contents: write  # allow GITHUB_TOKEN to push
+  contents: write
 
 jobs:
   build:
@@ -20,17 +20,20 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y gdal-bin sqlite3 zip unzip curl
+
       - name: Download and unzip Parcel_Sales
         run: |
           set -euo pipefail
           mkdir -p data/shp public
           curl -fL -o data/Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
           unzip -o data/Parcel_Sales.zip -d data/shp
+
       - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
+
       - name: Download and load MAT (Master Address Table) as 'mat'
         run: |
           set -euo pipefail
@@ -39,17 +42,20 @@ jobs:
           unzip -o data/MAT.zip -d data/mat
           MAT_SHP=$(ls data/mat/*.shp | head -n 1)
           ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -overwrite
+
       - name: Inspect MAT fields (for troubleshooting)
         run: |
           ogrinfo -ro -so -al data/sales.gpkg mat
+
       - name: Build latest-per-parcel (last 12 months) CSV with address (spatial join)
         run: |
           set -euo pipefail
           # Create spatial indexes if missing; ignore "already exists" errors
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index already exists"
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index already exists"
+
           cat > data/query.sql <<'SQL'
-          -- 1) Filter to last 12 months
+          -- 1) Filter to last 12 months AND positive sale price
           WITH recent AS (
             SELECT
               s.geom,
@@ -59,6 +65,8 @@ jobs:
               s.saledate
             FROM sales s
             WHERE date(s.saledate) >= date('now','-12 months')
+              AND s.saleprice IS NOT NULL
+              AND s.saleprice > 0         -- remove $0 (and null) sales here
           ),
           -- 2) Keep the latest sale per parcel
           latest AS (
@@ -77,9 +85,9 @@ jobs:
           mat_join AS (
             SELECT
               b.parcelid,
-              COALESCE(m.full_addre, m.address, '')  AS address,
+              COALESCE(m.full_addre, m.address, '')   AS address,
               COALESCE(m.nme_city,  m.nme_po_cit, '') AS city,
-              COALESCE(m.cde_zip1, '')               AS zipcode,
+              COALESCE(m.cde_zip1, '')                AS zipcode,
               ROW_NUMBER() OVER (
                 PARTITION BY b.parcelid
                 ORDER BY (m.full_addre IS NOT NULL) DESC,
@@ -106,9 +114,11 @@ jobs:
            AND j.addr_rank = 1
           ORDER BY date(b.saledate) DESC;
           SQL
+
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
             -sql "$(cat data/query.sql)"
+
       - name: Commit CSV
         run: |
           set -euo pipefail
