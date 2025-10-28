@@ -2,7 +2,7 @@ name: Build parcel sales CSV (weekly)
 
 on:
   schedule:
-    - cron: "15 10 * * 1"   # Mondays 10:15 UTC
+    - cron: "0 5 * * 1"   # Runs at 1 AM ET during summer, 12 AM ET during winter
   workflow_dispatch:
 
 permissions:
