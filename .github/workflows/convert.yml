@@ -11,7 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,85 +21,108 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gdal-bin sqlite3 zip unzip curl
 
-      - name: Download and unzip Parcel_Sales
+      - name: Download and unzip Parcel_Sales (cache-busted)
         run: |
           set -euo pipefail
           mkdir -p data/shp public
-          curl -fL -o data/Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
+          TS="$(date +%s)"
+          echo "Downloading Parcel_Sales.zip (ts=${TS})..."
+          curl -fL --retry 5 --retry-delay 5 \
+            -H "Cache-Control: no-cache" \
+            -o data/Parcel_Sales.zip \
+            "https://maps.mecknc.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
           unzip -o data/Parcel_Sales.zip -d data/shp
+          ls -l data/shp | sed 's/^/  /'
 
       - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
+          echo "Using shapefile: $SHP_FILE"
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
       - name: Download and load MAT (Master Address Table) as 'mat'
         run: |
           set -euo pipefail
           mkdir -p data/mat
-          curl -fL -o data/MAT.zip "https://maps.mecknc.gov/opendata/MAT.zip"
+          TS="$(date +%s)"
+          echo "Downloading MAT.zip (ts=${TS})..."
+          curl -fL --retry 5 --retry-delay 5 \
+            -H "Cache-Control: no-cache" \
+            -o data/MAT.zip \
+            "https://maps.mecknc.gov/opendata/MAT.zip?nocache=${TS}"
           unzip -o data/MAT.zip -d data/mat
           MAT_SHP=$(ls data/mat/*.shp | head -n 1)
+          echo "Using MAT shapefile: $MAT_SHP"
           ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -overwrite
+
+      - name: Quick sanity checks (date coverage)
+        run: |
+          set -euo pipefail
+          echo "== MIN/MAX sale date =="
+          ogrinfo -q data/sales.gpkg -sql "SELECT MIN(saledate) AS min_date, MAX(saledate) AS max_date, COUNT(*) AS n FROM sales"
+
+          echo "== Top 10 most recent dates in file =="
+          ogrinfo -q data/sales.gpkg -sql "SELECT saledate, COUNT(*) AS n FROM sales GROUP BY saledate ORDER BY date(saledate) DESC LIMIT 10"
+
+          # Fail fast if the latest date looks stale (> 3 days behind today)
+          MAX_DATE=$(ogrinfo -ro -q data/sales.gpkg -sql "SELECT MAX(saledate) FROM sales" | awk -F= '/MAX/ {gsub(/[[:space:]]*/,"",$2); print $2}')
+          echo "Detected MAX(saledate) = ${MAX_DATE}"
+          if [[ -n "${MAX_DATE}" ]]; then
+            # Convert both to epoch seconds (treat saledate as UTC)
+            NOW_EPOCH=$(date -u +%s)
+            MAX_EPOCH=$(date -u -d "${MAX_DATE}" +%s || echo "")
+            if [[ -n "${MAX_EPOCH}" ]]; then
+              AGE_DAYS=$(( (NOW_EPOCH - MAX_EPOCH) / 86400 ))
+              echo "Latest sale age: ${AGE_DAYS} day(s)"
+              if (( AGE_DAYS > 3 )); then
+                echo "::error ::Source dataset appears stale (MAX(saledate)=${MAX_DATE}, ${AGE_DAYS} days old)."
+                echo "        This usually means the ZIP response was cached upstream."
+                echo "        Re-run later, or check the county portal for the latest date."
+                exit 1
+              fi
+            fi
+          fi
 
       - name: Inspect MAT fields (for troubleshooting)
         run: |
           ogrinfo -ro -so -al data/sales.gpkg mat
 
-      - name: Sanity report (source snapshot)
+      - name: Build latest-per-parcel (last 12 months) CSV with address (spatial join)
         run: |
           set -euo pipefail
-          echo "---- sales table quick stats ----"
-          ogrinfo data/sales.gpkg -sql "SELECT COUNT(*) AS total_rows FROM sales"
-          ogrinfo data/sales.gpkg -sql "SELECT MIN(saledate) AS min_date, MAX(saledate) AS max_date FROM sales"
 
-          echo "---- last 14 days, with and without price>0 ----"
-          ogrinfo data/sales.gpkg -sql "SELECT COUNT(*) AS last14_all FROM sales WHERE date(saledate) >= date('now','-14 days')"
-          ogrinfo data/sales.gpkg -sql "SELECT COUNT(*) AS last14_pos FROM sales WHERE date(saledate) >= date('now','-14 days') AND saleprice > 0"
-
-          echo "---- last 7 days by price bucket (0 vs >0) ----"
-          ogrinfo data/sales.gpkg -sql "SELECT SUM(CASE WHEN saleprice=0 THEN 1 ELSE 0 END) AS zero_price, SUM(CASE WHEN saleprice>0 THEN 1 ELSE 0 END) AS positive FROM sales WHERE date(saledate) >= date('now','-7 days')"
-
-          echo "---- sample zero-price (if any) ----"
-          ogrinfo data/sales.gpkg -sql "SELECT parcelid, propertyid, saledate, saleprice FROM sales WHERE date(saledate) >= date('now','-14 days') AND (saleprice IS NULL OR saleprice=0) LIMIT 10"
-
-      - name: Build latest-per-parcel (last 12 months) CSV with address (keep zero-price, flag them)
-        run: |
-          set -euo pipefail
-          # Create spatial indexes if missing; ignore "already exists" errors
+          # Spatial indexes (ignore if already exist)
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index already exists"
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index already exists"
 
           cat > data/query.sql <<'SQL'
-          -- 1) Filter to last 12 months (keep all; flag zero-price)
+          -- 1) Filter to last 12 months AND positive sale price
           WITH recent AS (
             SELECT
               s.geom,
               s.parcelid,
               s.propertyid AS pid,
               s.saleprice,
-              s.saledate,
-              CASE WHEN s.saleprice IS NULL OR s.saleprice = 0 THEN 1 ELSE 0 END AS is_zero_price
+              s.saledate
             FROM sales s
             WHERE date(s.saledate) >= date('now','-12 months')
+              AND s.saleprice IS NOT NULL
+              AND s.saleprice > 0
           ),
-
           -- 2) Keep the latest sale per parcel
           latest AS (
             SELECT
-              geom, parcelid, pid, saleprice, saledate, is_zero_price,
+              geom, parcelid, pid, saleprice, saledate,
               ROW_NUMBER() OVER (
                 PARTITION BY parcelid
                 ORDER BY date(saledate) DESC
               ) AS rn
             FROM recent
           ),
-
           base AS (
             SELECT * FROM latest WHERE rn = 1
           ),
-
           -- 3) Spatial join to MAT points (address data)
           mat_join AS (
             SELECT
@@ -117,7 +139,6 @@ jobs:
             LEFT JOIN mat m
               ON ST_Intersects(m.geom, b.geom)
           )
-
           -- 4) Final projection
           SELECT
             CAST(ST_X(ST_Centroid(b.geom)) AS REAL) AS lon,
@@ -128,23 +149,20 @@ jobs:
             COALESCE(j.city, '')     AS city,
             COALESCE(j.zipcode, '')  AS zipcode,
             strftime('%Y-%m-%d', b.saledate) AS saledate,
-            b.saleprice,
-            b.is_zero_price
+            b.saleprice
           FROM base b
           LEFT JOIN mat_join j
             ON b.parcelid = j.parcelid
            AND j.addr_rank = 1
-          ORDER BY date(b.saledate) DESC, b.is_zero_price ASC;
+          ORDER BY date(b.saledate) DESC;
           SQL
 
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
             -sql "$(cat data/query.sql)"
 
-      - name: Show diff stat (if any)
-        run: |
-          git status --porcelain public/parcel_sales.csv || true
-          git diff --numstat public/parcel_sales.csv || true
+          echo "== Preview of newest 10 rows in output =="
+          head -n 11 public/parcel_sales.csv
 
       - name: Commit CSV
         run: |
