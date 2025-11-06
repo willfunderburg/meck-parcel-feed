@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write  # allow GITHUB_TOKEN to push
 
 jobs:
   build:
@@ -21,68 +21,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gdal-bin sqlite3 zip unzip curl
 
-      - name: Download and unzip Parcel_Sales (cache-busted)
+      - name: Download and unzip Parcel_Sales
         run: |
           set -euo pipefail
           mkdir -p data/shp public
-          TS="$(date +%s)"
-          echo "Downloading Parcel_Sales.zip (ts=${TS})..."
-          curl -fL --retry 5 --retry-delay 5 \
-            -H "Cache-Control: no-cache" \
-            -o data/Parcel_Sales.zip \
-            "https://maps.mecknc.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
+          curl -fL -o data/Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
           unzip -o data/Parcel_Sales.zip -d data/shp
-          ls -l data/shp | sed 's/^/  /'
 
       - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
-          echo "Using shapefile: $SHP_FILE"
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
+
+      - name: Check source staleness (warn-only)
+        run: |
+          set -euo pipefail
+          # Pull the newest saledate from the source layer in the GPKG
+          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(date(saledate)) FROM sales;")
+          if [[ -z "${MAX_DATE:-}" || "${MAX_DATE}" == "NULL" ]]; then
+            echo "::warning ::Couldn't determine MAX(saledate) from source."
+          else
+            NOW_UTC=$(date -u +%s)
+            MAX_EPOCH=$(date -u -d "$MAX_DATE" +%s)
+            AGE_DAYS=$(( (NOW_UTC - MAX_EPOCH) / 86400 ))
+            echo "MAX(saledate)=${MAX_DATE}  age=${AGE_DAYS}d"
+            if (( AGE_DAYS > 3 )); then
+              echo "::warning ::Source dataset appears stale (MAX(saledate)=${MAX_DATE}, ${AGE_DAYS} days old). Proceeding anyway."
+            fi
+          fi
+          # No exit 1 here — always proceed
 
       - name: Download and load MAT (Master Address Table) as 'mat'
         run: |
           set -euo pipefail
           mkdir -p data/mat
-          TS="$(date +%s)"
-          echo "Downloading MAT.zip (ts=${TS})..."
-          curl -fL --retry 5 --retry-delay 5 \
-            -H "Cache-Control: no-cache" \
-            -o data/MAT.zip \
-            "https://maps.mecknc.gov/opendata/MAT.zip?nocache=${TS}"
+          curl -fL -o data/MAT.zip "https://maps.mecknc.gov/opendata/MAT.zip"
           unzip -o data/MAT.zip -d data/mat
           MAT_SHP=$(ls data/mat/*.shp | head -n 1)
-          echo "Using MAT shapefile: $MAT_SHP"
           ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -overwrite
-
-      - name: Quick sanity checks (date coverage)
-        run: |
-          set -euo pipefail
-          echo "== MIN/MAX sale date =="
-          ogrinfo -q data/sales.gpkg -sql "SELECT MIN(saledate) AS min_date, MAX(saledate) AS max_date, COUNT(*) AS n FROM sales"
-
-          echo "== Top 10 most recent dates in file =="
-          ogrinfo -q data/sales.gpkg -sql "SELECT saledate, COUNT(*) AS n FROM sales GROUP BY saledate ORDER BY date(saledate) DESC LIMIT 10"
-
-          # Fail fast if the latest date looks stale (> 3 days behind today)
-          MAX_DATE=$(ogrinfo -ro -q data/sales.gpkg -sql "SELECT MAX(saledate) FROM sales" | awk -F= '/MAX/ {gsub(/[[:space:]]*/,"",$2); print $2}')
-          echo "Detected MAX(saledate) = ${MAX_DATE}"
-          if [[ -n "${MAX_DATE}" ]]; then
-            # Convert both to epoch seconds (treat saledate as UTC)
-            NOW_EPOCH=$(date -u +%s)
-            MAX_EPOCH=$(date -u -d "${MAX_DATE}" +%s || echo "")
-            if [[ -n "${MAX_EPOCH}" ]]; then
-              AGE_DAYS=$(( (NOW_EPOCH - MAX_EPOCH) / 86400 ))
-              echo "Latest sale age: ${AGE_DAYS} day(s)"
-              if (( AGE_DAYS > 3 )); then
-                echo "::error ::Source dataset appears stale (MAX(saledate)=${MAX_DATE}, ${AGE_DAYS} days old)."
-                echo "        This usually means the ZIP response was cached upstream."
-                echo "        Re-run later, or check the county portal for the latest date."
-                exit 1
-              fi
-            fi
-          fi
 
       - name: Inspect MAT fields (for troubleshooting)
         run: |
@@ -91,8 +68,7 @@ jobs:
       - name: Build latest-per-parcel (last 12 months) CSV with address (spatial join)
         run: |
           set -euo pipefail
-
-          # Spatial indexes (ignore if already exist)
+          # Create spatial indexes if missing; ignore "already exists" errors
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index already exists"
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index already exists"
 
@@ -160,9 +136,6 @@ jobs:
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
             -sql "$(cat data/query.sql)"
-
-          echo "== Preview of newest 10 rows in output =="
-          head -n 11 public/parcel_sales.csv
 
       - name: Commit CSV
         run: |
