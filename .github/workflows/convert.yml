@@ -25,19 +25,44 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/shp public
-          curl -fL -o data/Parcel_Sales.zip "https://maps.mecknc.gov/opendata/Parcel_Sales.zip"
+
+          TS="$(date +%s)"
+          SALES_URLS=(
+            "https://maps.mecknc.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
+            "https://maps.mecklenburgcountync.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
+          )
+
+          FOUND_URL=""
+          for URL in "${SALES_URLS[@]}"; do
+            echo "Trying Parcel_Sales download: ${URL}"
+            if curl -fL --retry 3 --retry-delay 5 \
+              -H "Cache-Control: no-cache" \
+              -o data/Parcel_Sales.zip \
+              "${URL}"; then
+              FOUND_URL="${URL}"
+              break
+            fi
+          done
+
+          if [[ -z "${FOUND_URL}" ]]; then
+            echo "::error ::Parcel_Sales.zip could not be downloaded from any known URL."
+            printf ' - %s\n' "${SALES_URLS[@]}"
+            exit 1
+          fi
+
+          echo "Downloaded Parcel_Sales from: ${FOUND_URL}"
           unzip -o data/Parcel_Sales.zip -d data/shp
 
       - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
+          echo "Using shapefile: ${SHP_FILE}"
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
       - name: Check source staleness (warn-only)
         run: |
           set -euo pipefail
-          # Pull the newest saledate from the source layer in the GPKG
           MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(date(saledate)) FROM sales;")
           if [[ -z "${MAX_DATE:-}" || "${MAX_DATE}" == "NULL" ]]; then
             echo "::warning ::Couldn't determine MAX(saledate) from source."
@@ -50,15 +75,46 @@ jobs:
               echo "::warning ::Source dataset appears stale (MAX(saledate)=${MAX_DATE}, ${AGE_DAYS} days old). Proceeding anyway."
             fi
           fi
-          # No exit 1 here — always proceed
 
       - name: Download and load MAT (Master Address Table) as 'mat'
         run: |
           set -euo pipefail
           mkdir -p data/mat
-          curl -fL -o data/MAT.zip "https://maps.mecknc.gov/opendata/MAT.zip"
+
+          TS="$(date +%s)"
+          MAT_URLS=(
+            "https://maps.mecknc.gov/opendata/MAT.zip?nocache=${TS}"
+            "https://maps.mecklenburgcountync.gov/opendata/MAT.zip?nocache=${TS}"
+          )
+
+          FOUND_URL=""
+          for URL in "${MAT_URLS[@]}"; do
+            echo "Trying MAT download: ${URL}"
+            if curl -fL --retry 3 --retry-delay 5 \
+              -H "Cache-Control: no-cache" \
+              -o data/MAT.zip \
+              "${URL}"; then
+              FOUND_URL="${URL}"
+              break
+            fi
+          done
+
+          if [[ -z "${FOUND_URL}" ]]; then
+            echo "::error ::MAT.zip could not be downloaded from any known URL."
+            printf ' - %s\n' "${MAT_URLS[@]}"
+            exit 1
+          fi
+
+          echo "Downloaded MAT from: ${FOUND_URL}"
           unzip -o data/MAT.zip -d data/mat
+
           MAT_SHP=$(ls data/mat/*.shp | head -n 1)
+          if [[ -z "${MAT_SHP}" ]]; then
+            echo "::error ::MAT ZIP downloaded but no .shp file was found after unzip."
+            exit 1
+          fi
+
+          echo "Using MAT shapefile: ${MAT_SHP}"
           ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -overwrite
 
       - name: Inspect MAT fields (for troubleshooting)
@@ -68,6 +124,7 @@ jobs:
       - name: Build latest-per-parcel (last 12 months) CSV with address (spatial join)
         run: |
           set -euo pipefail
+
           # Create spatial indexes if missing; ignore "already exists" errors
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index already exists"
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index already exists"
@@ -86,6 +143,7 @@ jobs:
               AND s.saleprice IS NOT NULL
               AND s.saleprice > 0
           ),
+
           -- 2) Keep the latest sale per parcel
           latest AS (
             SELECT
@@ -96,9 +154,11 @@ jobs:
               ) AS rn
             FROM recent
           ),
+
           base AS (
             SELECT * FROM latest WHERE rn = 1
           ),
+
           -- 3) Spatial join to MAT points (address data)
           mat_join AS (
             SELECT
@@ -115,6 +175,7 @@ jobs:
             LEFT JOIN mat m
               ON ST_Intersects(m.geom, b.geom)
           )
+
           -- 4) Final projection
           SELECT
             CAST(ST_X(ST_Centroid(b.geom)) AS REAL) AS lon,
