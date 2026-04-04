@@ -150,47 +150,110 @@ jobs:
         run: |
           set -euo pipefail
 
+          # --- Attempt 1: ZIP download ---
           TS="$(date +%s)"
           MAT_URLS=(
             "https://maps.mecklenburgcountync.gov/opendata/MAT.zip?nocache=${TS}"
             "https://maps.mecknc.gov/opendata/MAT.zip?nocache=${TS}"
           )
 
-          FOUND_URL=""
+          ZIP_OK=false
           for URL in "${MAT_URLS[@]}"; do
-            echo "Trying MAT download: ${URL}"
+            echo "Trying MAT ZIP download: ${URL}"
             if curl -fL --retry 3 --retry-delay 5 \
               -H "Cache-Control: no-cache" \
               -o data/MAT.zip \
               "${URL}"; then
-              FOUND_URL="${URL}"
+              echo "Downloaded MAT ZIP from: ${URL}"
+              unzip -o data/MAT.zip -d data/mat
+              MAT_SHP=$(ls data/mat/*.shp 2>/dev/null | head -n 1)
+              if [[ -n "${MAT_SHP}" ]]; then
+                echo "Using MAT shapefile: ${MAT_SHP}"
+                ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -append
+                ZIP_OK=true
+              fi
               break
             fi
           done
 
-          if [[ -z "${FOUND_URL}" ]]; then
-            echo "::warning ::MAT.zip unavailable — addresses will be empty this run."
-            printf ' - %s\n' "${MAT_URLS[@]}"
-            echo "mat_available=false" >> "$GITHUB_OUTPUT"
+          if [[ "${ZIP_OK}" == "true" ]]; then
+            echo "mat_available=true" >> "$GITHUB_OUTPUT"
+            echo "=== MAT layer schema ==="
+            ogrinfo -ro -so -al data/sales.gpkg mat
             exit 0
           fi
 
-          echo "Downloaded MAT from: ${FOUND_URL}"
-          unzip -o data/MAT.zip -d data/mat
+          echo "MAT ZIP unavailable from all URLs. Falling back to ArcGIS REST API..."
 
-          MAT_SHP=$(ls data/mat/*.shp | head -n 1)
-          if [[ -z "${MAT_SHP}" ]]; then
-            echo "::warning ::MAT ZIP downloaded but no .shp found — addresses will be empty."
+          # --- Attempt 2: ArcGIS REST API with pagination ---
+          BASE_URL="https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/0/query"
+          FIELDS="full_addre,address,nme_city,nme_po_cit,cde_zip1"
+          BATCH=2000
+          OFFSET=0
+          TOTAL=0
+          FIRST=true
+
+          while true; do
+            API_URL="${BASE_URL}?where=1%3D1&outFields=${FIELDS}&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
+            echo "Fetching MAT batch: offset=${OFFSET} ..."
+
+            if ! curl -fL --retry 2 --retry-delay 3 --max-time 60 \
+              -o data/mat_batch.json "${API_URL}"; then
+              echo "::warning ::MAT REST API request failed at offset ${OFFSET}."
+              break
+            fi
+
+            # Check how many features we got
+            FEAT_COUNT=$(python3 -c "
+          import json, sys
+          try:
+              d = json.load(open('data/mat_batch.json'))
+              print(len(d.get('features', [])))
+          except Exception as e:
+              print(0, file=sys.stderr)
+              print(0)
+          ")
+
+            if (( FEAT_COUNT == 0 )); then
+              echo "No more features at offset ${OFFSET}. Done."
+              break
+            fi
+
+            # Append batch to GPKG
+            if [[ "${FIRST}" == "true" ]]; then
+              ogr2ogr -f GPKG data/sales.gpkg data/mat_batch.json \
+                -t_srs EPSG:4326 -nln mat -append
+              FIRST=false
+            else
+              ogr2ogr -f GPKG data/sales.gpkg data/mat_batch.json \
+                -t_srs EPSG:4326 -nln mat -append
+            fi
+
+            TOTAL=$((TOTAL + FEAT_COUNT))
+            OFFSET=$((OFFSET + BATCH))
+
+            # Check if server indicated more results
+            EXCEEDED=$(python3 -c "
+          import json
+          d = json.load(open('data/mat_batch.json'))
+          print('true' if d.get('exceededTransferLimit', False) else 'false')
+          ")
+            if [[ "${EXCEEDED}" != "true" ]]; then
+              echo "Server indicates no more pages. Done."
+              break
+            fi
+          done
+
+          echo "Total MAT records loaded via REST API: ${TOTAL}"
+
+          if (( TOTAL > 0 )); then
+            echo "mat_available=true" >> "$GITHUB_OUTPUT"
+            echo "=== MAT layer schema ==="
+            ogrinfo -ro -so -al data/sales.gpkg mat
+          else
+            echo "::warning ::Could not load MAT from ZIP or REST API — addresses will be empty."
             echo "mat_available=false" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
-
-          echo "Using MAT shapefile: ${MAT_SHP}"
-          ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -append
-          echo "mat_available=true" >> "$GITHUB_OUTPUT"
-
-          echo "=== MAT layer schema ==="
-          ogrinfo -ro -so -al data/sales.gpkg mat
 
       - name: Build CSV
         run: |
