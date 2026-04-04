@@ -28,8 +28,8 @@ jobs:
 
           TS="$(date +%s)"
           SALES_URLS=(
-            "https://maps.mecknc.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
             "https://maps.mecklenburgcountync.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
+            "https://maps.mecknc.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
           )
 
           FOUND_URL=""
@@ -62,7 +62,11 @@ jobs:
 
       - name: Inspect sales fields
         run: |
+          echo "=== Sales layer schema ==="
           ogrinfo -ro -so -al data/sales.gpkg sales
+          echo ""
+          echo "=== Sample rows (first 3) ==="
+          ogrinfo -ro -al data/sales.gpkg sales -limit 3
 
       - name: Check source staleness (warn-only)
         run: |
@@ -80,14 +84,76 @@ jobs:
             fi
           fi
 
-      - name: Download and load MAT (Master Address Table) as 'mat'
+      - name: Detect address fields in sales layer
+        id: detect_fields
+        run: |
+          set -euo pipefail
+          FIELDS=$(sqlite3 data/sales.gpkg "PRAGMA table_info(sales);" | cut -d'|' -f2 | tr '\n' ',' )
+          echo "Available fields: ${FIELDS}"
+
+          # Check for common address field names (case-insensitive via sqlite)
+          HAS_ADDR=$(sqlite3 data/sales.gpkg "
+            SELECT COUNT(*) FROM pragma_table_info('sales')
+            WHERE lower(name) IN ('site_addr','siteaddres','siteaddress','site_address','address','full_addre','propaddr','location_a','street_add')
+          ")
+          HAS_CITY=$(sqlite3 data/sales.gpkg "
+            SELECT COUNT(*) FROM pragma_table_info('sales')
+            WHERE lower(name) IN ('city','nme_city','site_city','citydesc','city_name')
+          ")
+          HAS_ZIP=$(sqlite3 data/sales.gpkg "
+            SELECT COUNT(*) FROM pragma_table_info('sales')
+            WHERE lower(name) IN ('zipcode','zip','zip_code','cde_zip1','site_zip','postalcode')
+          ")
+
+          echo "has_addr=${HAS_ADDR}"
+          echo "has_city=${HAS_CITY}"
+          echo "has_zip=${HAS_ZIP}"
+
+          if (( HAS_ADDR > 0 )); then
+            # Find the actual field name
+            ADDR_FIELD=$(sqlite3 data/sales.gpkg "
+              SELECT name FROM pragma_table_info('sales')
+              WHERE lower(name) IN ('site_addr','siteaddres','siteaddress','site_address','address','full_addre','propaddr','location_a','street_add')
+              LIMIT 1
+            ")
+            echo "addr_field=${ADDR_FIELD}" >> "$GITHUB_OUTPUT"
+          fi
+          if (( HAS_CITY > 0 )); then
+            CITY_FIELD=$(sqlite3 data/sales.gpkg "
+              SELECT name FROM pragma_table_info('sales')
+              WHERE lower(name) IN ('city','nme_city','site_city','citydesc','city_name')
+              LIMIT 1
+            ")
+            echo "city_field=${CITY_FIELD}" >> "$GITHUB_OUTPUT"
+          fi
+          if (( HAS_ZIP > 0 )); then
+            ZIP_FIELD=$(sqlite3 data/sales.gpkg "
+              SELECT name FROM pragma_table_info('sales')
+              WHERE lower(name) IN ('zipcode','zip','zip_code','cde_zip1','site_zip','postalcode')
+              LIMIT 1
+            ")
+            echo "zip_field=${ZIP_FIELD}" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Determine strategy
+          if (( HAS_ADDR > 0 )); then
+            echo "strategy=sales_direct" >> "$GITHUB_OUTPUT"
+            echo "Address fields found in Parcel_Sales — will use directly (no MAT needed)."
+          else
+            echo "strategy=needs_mat" >> "$GITHUB_OUTPUT"
+            echo "No address fields in Parcel_Sales — will attempt MAT download."
+          fi
+
+      - name: Download MAT (if needed for addresses)
+        if: steps.detect_fields.outputs.strategy == 'needs_mat'
+        id: mat_download
         run: |
           set -euo pipefail
 
           TS="$(date +%s)"
           MAT_URLS=(
-            "https://maps.mecknc.gov/opendata/MAT.zip?nocache=${TS}"
             "https://maps.mecklenburgcountync.gov/opendata/MAT.zip?nocache=${TS}"
+            "https://maps.mecknc.gov/opendata/MAT.zip?nocache=${TS}"
           )
 
           FOUND_URL=""
@@ -103,9 +169,10 @@ jobs:
           done
 
           if [[ -z "${FOUND_URL}" ]]; then
-            echo "::error ::MAT.zip could not be downloaded from any known URL."
+            echo "::warning ::MAT.zip unavailable — addresses will be empty this run."
             printf ' - %s\n' "${MAT_URLS[@]}"
-            exit 1
+            echo "mat_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "Downloaded MAT from: ${FOUND_URL}"
@@ -113,88 +180,148 @@ jobs:
 
           MAT_SHP=$(ls data/mat/*.shp | head -n 1)
           if [[ -z "${MAT_SHP}" ]]; then
-            echo "::error ::MAT ZIP downloaded but no .shp file was found after unzip."
-            exit 1
+            echo "::warning ::MAT ZIP downloaded but no .shp found — addresses will be empty."
+            echo "mat_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "Using MAT shapefile: ${MAT_SHP}"
           ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -append
+          echo "mat_available=true" >> "$GITHUB_OUTPUT"
 
-      - name: Inspect MAT fields
-        run: |
+          echo "=== MAT layer schema ==="
           ogrinfo -ro -so -al data/sales.gpkg mat
 
-      - name: Build latest-per-parcel (last 12 months) CSV with address (spatial join)
+      - name: Build CSV
         run: |
           set -euo pipefail
 
-          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || echo "sales spatial index already exists"
-          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')"   || echo "mat spatial index already exists"
+          STRATEGY="${{ steps.detect_fields.outputs.strategy }}"
+          MAT_OK="${{ steps.mat_download.outputs.mat_available }}"
+          ADDR_FIELD="${{ steps.detect_fields.outputs.addr_field }}"
+          CITY_FIELD="${{ steps.detect_fields.outputs.city_field }}"
+          ZIP_FIELD="${{ steps.detect_fields.outputs.zip_field }}"
 
-          cat > data/query.sql <<'SQL'
-          -- 1) Filter to last 12 months AND positive sale price
-          WITH recent AS (
-            SELECT
-              s.geom,
-              s.parcelid,
-              s.propertyid AS pid,
-              s.saleprice,
-              s.saledate
-            FROM sales s
-            WHERE date(s.saledate) >= date('now','-12 months')
-              AND s.saleprice IS NOT NULL
-              AND s.saleprice > 0
-          ),
+          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || true
 
-          -- 2) Keep the latest sale per parcel
-          latest AS (
-            SELECT
-              geom, parcelid, pid, saleprice, saledate,
-              ROW_NUMBER() OVER (
-                PARTITION BY parcelid
-                ORDER BY date(saledate) DESC
+          if [[ "${STRATEGY}" == "sales_direct" ]]; then
+            echo "Using address fields directly from Parcel_Sales layer."
+            ADDR_EXPR="COALESCE(s.${ADDR_FIELD:-NULL}, '')"
+            CITY_EXPR="COALESCE(s.${CITY_FIELD:-NULL}, '')"
+            ZIP_EXPR="COALESCE(s.${ZIP_FIELD:-NULL}, '')"
+
+            cat > data/query.sql <<SQL
+            WITH recent AS (
+              SELECT
+                s.geom, s.parcelid, s.propertyid AS pid,
+                s.saleprice, s.saledate,
+                ${ADDR_EXPR} AS address,
+                ${CITY_EXPR} AS city,
+                ${ZIP_EXPR}  AS zipcode
+              FROM sales s
+              WHERE date(s.saledate) >= date('now','-12 months')
+                AND s.saleprice IS NOT NULL AND s.saleprice > 0
+            ),
+            latest AS (
+              SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY parcelid ORDER BY date(saledate) DESC
               ) AS rn
-            FROM recent
-          ),
-
-          base AS (
-            SELECT * FROM latest WHERE rn = 1
-          ),
-
-          -- 3) Spatial join to MAT points (address data)
-          mat_join AS (
+              FROM recent
+            )
             SELECT
-              b.parcelid,
-              COALESCE(m.full_addre, m.address, '')   AS address,
-              COALESCE(m.nme_city,  m.nme_po_cit, '') AS city,
-              COALESCE(m.cde_zip1, '')                AS zipcode,
-              ROW_NUMBER() OVER (
-                PARTITION BY b.parcelid
-                ORDER BY (m.full_addre IS NOT NULL) DESC,
-                         (m.address   IS NOT NULL) DESC
-              ) AS addr_rank
-            FROM base b
-            LEFT JOIN mat m
-              ON ST_Intersects(m.geom, b.geom)
-          )
-
-          -- 4) Final projection
-          SELECT
-            CAST(ST_X(ST_Centroid(b.geom)) AS REAL) AS lon,
-            CAST(ST_Y(ST_Centroid(b.geom)) AS REAL) AS lat,
-            b.pid,
-            b.parcelid,
-            COALESCE(j.address, '')  AS address,
-            COALESCE(j.city, '')     AS city,
-            COALESCE(j.zipcode, '')  AS zipcode,
-            strftime('%Y-%m-%d', b.saledate) AS saledate,
-            b.saleprice
-          FROM base b
-          LEFT JOIN mat_join j
-            ON b.parcelid = j.parcelid
-           AND j.addr_rank = 1
-          ORDER BY date(b.saledate) DESC;
+              CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
+              CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
+              pid, parcelid, address, city, zipcode,
+              strftime('%Y-%m-%d', saledate) AS saledate,
+              saleprice
+            FROM latest WHERE rn = 1
+            ORDER BY date(saledate) DESC;
           SQL
+
+          elif [[ "${STRATEGY}" == "needs_mat" && "${MAT_OK}" == "true" ]]; then
+            echo "Using MAT spatial join for address data."
+            ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')" || true
+
+            cat > data/query.sql <<'SQL'
+            WITH recent AS (
+              SELECT
+                s.geom, s.parcelid, s.propertyid AS pid,
+                s.saleprice, s.saledate
+              FROM sales s
+              WHERE date(s.saledate) >= date('now','-12 months')
+                AND s.saleprice IS NOT NULL AND s.saleprice > 0
+            ),
+            latest AS (
+              SELECT geom, parcelid, pid, saleprice, saledate,
+                ROW_NUMBER() OVER (
+                  PARTITION BY parcelid ORDER BY date(saledate) DESC
+                ) AS rn
+              FROM recent
+            ),
+            base AS (
+              SELECT * FROM latest WHERE rn = 1
+            ),
+            mat_join AS (
+              SELECT
+                b.parcelid,
+                COALESCE(m.full_addre, m.address, '')   AS address,
+                COALESCE(m.nme_city,  m.nme_po_cit, '') AS city,
+                COALESCE(m.cde_zip1, '')                AS zipcode,
+                ROW_NUMBER() OVER (
+                  PARTITION BY b.parcelid
+                  ORDER BY (m.full_addre IS NOT NULL) DESC,
+                           (m.address   IS NOT NULL) DESC
+                ) AS addr_rank
+              FROM base b
+              LEFT JOIN mat m ON ST_Intersects(m.geom, b.geom)
+            )
+            SELECT
+              CAST(ST_X(ST_Centroid(b.geom)) AS REAL) AS lon,
+              CAST(ST_Y(ST_Centroid(b.geom)) AS REAL) AS lat,
+              b.pid, b.parcelid,
+              COALESCE(j.address, '')  AS address,
+              COALESCE(j.city, '')     AS city,
+              COALESCE(j.zipcode, '')  AS zipcode,
+              strftime('%Y-%m-%d', b.saledate) AS saledate,
+              b.saleprice
+            FROM base b
+            LEFT JOIN mat_join j
+              ON b.parcelid = j.parcelid AND j.addr_rank = 1
+            ORDER BY date(b.saledate) DESC;
+          SQL
+
+          else
+            echo "::warning ::No address source available — address/city/zipcode will be empty."
+            cat > data/query.sql <<'SQL'
+            WITH recent AS (
+              SELECT
+                s.geom, s.parcelid, s.propertyid AS pid,
+                s.saleprice, s.saledate
+              FROM sales s
+              WHERE date(s.saledate) >= date('now','-12 months')
+                AND s.saleprice IS NOT NULL AND s.saleprice > 0
+            ),
+            latest AS (
+              SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY parcelid ORDER BY date(saledate) DESC
+              ) AS rn
+              FROM recent
+            )
+            SELECT
+              CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
+              CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
+              pid, parcelid,
+              '' AS address, '' AS city, '' AS zipcode,
+              strftime('%Y-%m-%d', saledate) AS saledate,
+              saleprice
+            FROM latest WHERE rn = 1
+            ORDER BY date(saledate) DESC;
+          SQL
+          fi
+
+          echo "=== Query ==="
+          cat data/query.sql
+          echo ""
 
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
@@ -209,6 +336,14 @@ jobs:
             echo "::error ::Output CSV is empty — something went wrong with the query."
             exit 1
           fi
+          # Check if addresses are populated
+          ADDR_FILLED=$(awk -F',' 'NR>1 && $5!="" {count++} END {print count+0}' public/parcel_sales.csv)
+          TOTAL=$((ROW_COUNT - 1))
+          echo "Rows with address data: ${ADDR_FILLED}/${TOTAL}"
+          if (( ADDR_FILLED == 0 )); then
+            echo "::warning ::No address data in output — all address fields are empty."
+          fi
+          echo ""
           echo "Sample output:"
           head -5 public/parcel_sales.csv
 
