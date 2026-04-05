@@ -221,6 +221,7 @@ jobs:
           while true; do
             API_URL="${BASE_URL}?where=1%3D1&outFields=${FIELDS}&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
             echo "Fetching MAT batch: offset=${OFFSET} ..."
+            echo "URL: ${API_URL}"
 
             if ! curl -fL --retry 2 --retry-delay 3 --max-time 60 \
               -o data/mat_batch.json "${API_URL}"; then
@@ -228,14 +229,21 @@ jobs:
               break
             fi
 
+            # Log response size and first 500 chars for debugging
+            echo "Response size: $(wc -c < data/mat_batch.json) bytes"
+            head -c 500 data/mat_batch.json
+            echo ""
+
             # Check how many features we got
             FEAT_COUNT=$(python3 -c "
           import json, sys
           try:
               d = json.load(open('data/mat_batch.json'))
+              if 'error' in d:
+                  print('API error: ' + json.dumps(d['error']), file=sys.stderr)
               print(len(d.get('features', [])))
           except Exception as e:
-              print(0, file=sys.stderr)
+              print('Parse error: ' + str(e), file=sys.stderr)
               print(0)
           ")
 
