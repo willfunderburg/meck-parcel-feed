@@ -190,22 +190,32 @@ jobs:
             "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/0/query"
             "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer/0/query"
           )
-          FIELDS="full_addre,address,nme_city,nme_po_cit,cde_zip1"
           BATCH=2000
 
-          # Find a working REST endpoint
+          # Find a working REST endpoint by fetching 1 record with all fields
           BASE_URL=""
           for EP in "${REST_ENDPOINTS[@]}"; do
             echo "Testing REST endpoint: ${EP}"
             if curl -fsSL --max-time 15 \
-              "${EP}?where=1%3D1&outFields=OBJECTID&returnGeometry=false&f=json&resultRecordCount=1" \
-              -o /dev/null; then
-              BASE_URL="${EP}"
-              echo "Using REST endpoint: ${BASE_URL}"
-              break
-            else
-              echo "Endpoint unavailable, trying next..."
+              -o data/mat_probe.json \
+              "${EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1"; then
+              # Verify it actually returned features
+              PROBE_COUNT=$(python3 -c "
+          import json
+          d = json.load(open('data/mat_probe.json'))
+          feats = d.get('features', [])
+          print(len(feats))
+          if feats:
+              print('Fields: ' + ', '.join(feats[0].get('attributes', {}).keys()), flush=True)
+          " 2>&1)
+              echo "Probe result: ${PROBE_COUNT}"
+              if [[ "${PROBE_COUNT}" == *"Fields:"* ]]; then
+                BASE_URL="${EP}"
+                echo "Using REST endpoint: ${BASE_URL}"
+                break
+              fi
             fi
+            echo "Endpoint unavailable or returned no features, trying next..."
           done
 
           if [[ -z "${BASE_URL}" ]]; then
@@ -219,7 +229,7 @@ jobs:
           FIRST=true
 
           while true; do
-            API_URL="${BASE_URL}?where=1%3D1&outFields=${FIELDS}&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
+            API_URL="${BASE_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
             echo "Fetching MAT batch: offset=${OFFSET} ..."
             echo "URL: ${API_URL}"
 
@@ -286,7 +296,39 @@ jobs:
           else
             echo "::warning ::Could not load MAT from ZIP or REST API — addresses will be empty."
             echo "mat_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # Discover actual MAT field names for address, city, zip
+          MAT_FIELDS=$(sqlite3 data/sales.gpkg "PRAGMA table_info(mat);" | cut -d'|' -f2 | tr '\n' ',' )
+          echo "MAT fields: ${MAT_FIELDS}"
+
+          # Address field
+          MAT_ADDR=$(sqlite3 data/sales.gpkg "
+            SELECT name FROM pragma_table_info('mat')
+            WHERE lower(name) IN ('full_addre','full_address','address','siteaddres','siteaddress','site_addr','site_address','propaddr','street_add','location_a','txt_addres')
+            LIMIT 1
+          ")
+          echo "mat_addr_field=${MAT_ADDR:-(none)}"
+          echo "mat_addr_field=${MAT_ADDR}" >> "$GITHUB_OUTPUT"
+
+          # City field
+          MAT_CITY=$(sqlite3 data/sales.gpkg "
+            SELECT name FROM pragma_table_info('mat')
+            WHERE lower(name) IN ('nme_city','nme_po_cit','city','city_name','site_city','citydesc','municipali')
+            LIMIT 1
+          ")
+          echo "mat_city_field=${MAT_CITY:-(none)}"
+          echo "mat_city_field=${MAT_CITY}" >> "$GITHUB_OUTPUT"
+
+          # Zip field
+          MAT_ZIP=$(sqlite3 data/sales.gpkg "
+            SELECT name FROM pragma_table_info('mat')
+            WHERE lower(name) IN ('cde_zip1','zipcode','zip','zip_code','site_zip','postalcode','postal_cod')
+            LIMIT 1
+          ")
+          echo "mat_zip_field=${MAT_ZIP:-(none)}"
+          echo "mat_zip_field=${MAT_ZIP}" >> "$GITHUB_OUTPUT"
 
       - name: Build CSV
         run: |
@@ -338,7 +380,32 @@ jobs:
             echo "Using MAT spatial join for address data."
             ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')" || true
 
-            cat > data/query.sql <<'SQL'
+            MAT_ADDR_FIELD="${{ steps.mat_download.outputs.mat_addr_field }}"
+            MAT_CITY_FIELD="${{ steps.mat_download.outputs.mat_city_field }}"
+            MAT_ZIP_FIELD="${{ steps.mat_download.outputs.mat_zip_field }}"
+
+            # Build COALESCE expressions based on discovered fields
+            if [[ -n "${MAT_ADDR_FIELD}" ]]; then
+              ADDR_SQL="COALESCE(m.${MAT_ADDR_FIELD}, '')"
+            else
+              ADDR_SQL="''"
+            fi
+            if [[ -n "${MAT_CITY_FIELD}" ]]; then
+              CITY_SQL="COALESCE(m.${MAT_CITY_FIELD}, '')"
+            else
+              CITY_SQL="''"
+            fi
+            if [[ -n "${MAT_ZIP_FIELD}" ]]; then
+              ZIP_SQL="COALESCE(m.${MAT_ZIP_FIELD}, '')"
+            else
+              ZIP_SQL="''"
+            fi
+
+            echo "Address SQL: ${ADDR_SQL}"
+            echo "City SQL: ${CITY_SQL}"
+            echo "Zip SQL: ${ZIP_SQL}"
+
+            cat > data/query.sql <<SQL
             WITH recent AS (
               SELECT
                 s.geom, s.parcelid, s.propertyid AS pid,
@@ -360,13 +427,12 @@ jobs:
             mat_join AS (
               SELECT
                 b.parcelid,
-                COALESCE(m.full_addre, m.address, '')   AS address,
-                COALESCE(m.nme_city,  m.nme_po_cit, '') AS city,
-                COALESCE(m.cde_zip1, '')                AS zipcode,
+                ${ADDR_SQL} AS address,
+                ${CITY_SQL} AS city,
+                ${ZIP_SQL}  AS zipcode,
                 ROW_NUMBER() OVER (
                   PARTITION BY b.parcelid
-                  ORDER BY (m.full_addre IS NOT NULL) DESC,
-                           (m.address   IS NOT NULL) DESC
+                  ORDER BY (${ADDR_SQL} != '') DESC
                 ) AS addr_rank
               FROM base b
               LEFT JOIN mat m ON ST_Intersects(m.geom, b.geom)
