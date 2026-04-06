@@ -181,8 +181,9 @@ jobs:
 
           # --- Attempt 2: ArcGIS REST API with pagination ---
           REST_ENDPOINTS=(
-            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/0/query"
             "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer/0/query"
+            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/0/query"
+            "https://gis.charlottenc.gov/arcgis/rest/services/Accela/Accela/MapServer/1/query"
           )
           BATCH=2000
 
