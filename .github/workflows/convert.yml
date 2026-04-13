@@ -334,10 +334,10 @@ jobs:
           sqlite3 data/sales.gpkg "
             SELECT 'max_saledate' AS metric, MAX(substr(saledate,1,10)) AS value FROM sales
             UNION ALL SELECT 'min_saledate', MIN(substr(saledate,1,10)) FROM sales
-            UNION ALL SELECT 'date_threshold', date('now','-12 months')
-            UNION ALL SELECT 'rows_date_match', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months')
+            UNION ALL SELECT 'date_threshold_now', date('now','-12 months')
+            UNION ALL SELECT 'rows_date_match_now', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months')
             UNION ALL SELECT 'rows_price_gt_0', CAST(COUNT(*) AS TEXT) FROM sales WHERE saleprice IS NOT NULL AND saleprice > 0
-            UNION ALL SELECT 'rows_both_filters', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;
+            UNION ALL SELECT 'rows_both_filters_now', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;
           "
           echo "=== Sample recent saleprice values ==="
           sqlite3 data/sales.gpkg "SELECT substr(saledate,1,10) AS dt, saleprice, typeof(saleprice) FROM sales ORDER BY substr(saledate,1,10) DESC LIMIT 5;"
@@ -358,6 +358,15 @@ jobs:
           fi
           echo "=== Strategy: ${STRATEGY}, MAT available: ${MAT_OK} ==="
 
+          # Compute date cutoff: last 12 months of available data (not from today)
+          MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate,1,10)) FROM sales WHERE saleprice IS NOT NULL AND saleprice > 0;")
+          if [[ -z "${MAX_SALE_DATE}" || "${MAX_SALE_DATE}" == "NULL" ]]; then
+            echo "::error ::No valid sales found in dataset."
+            exit 1
+          fi
+          DATE_CUTOFF=$(sqlite3 data/sales.gpkg "SELECT date('${MAX_SALE_DATE}', '-12 months');")
+          echo "Most recent sale: ${MAX_SALE_DATE}, cutoff (12 months prior): ${DATE_CUTOFF}"
+
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || true
 
           if [[ "${STRATEGY}" == "sales_direct" ]]; then
@@ -375,7 +384,7 @@ jobs:
                 ${CITY_EXPR} AS city,
                 ${ZIP_EXPR}  AS zipcode
               FROM sales s
-              WHERE substr(s.saledate, 1, 10) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
@@ -429,7 +438,7 @@ jobs:
                 s.geom, s.parcelid, s.propertyid AS pid,
                 s.saleprice, s.saledate
               FROM sales s
-              WHERE substr(s.saledate, 1, 10) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
@@ -472,13 +481,13 @@ jobs:
 
           else
             echo "::warning ::No address source available — address/city/zipcode will be empty."
-            cat > data/query.sql <<'SQL'
+            cat > data/query.sql <<SQL
             WITH recent AS (
               SELECT
                 s.geom, s.parcelid, s.propertyid AS pid,
                 s.saleprice, s.saledate
               FROM sales s
-              WHERE substr(s.saledate, 1, 10) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
@@ -516,7 +525,7 @@ jobs:
             cat data/query.sql
             echo ""
             echo "=== Diagnostic: filtered row count ==="
-            sqlite3 data/sales.gpkg "SELECT COUNT(*) AS cnt FROM sales WHERE substr(saledate, 1, 10) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;" || true
+            sqlite3 data/sales.gpkg "SELECT COUNT(*) AS cnt FROM sales WHERE substr(saledate, 1, 10) >= '${DATE_CUTOFF}' AND saleprice IS NOT NULL AND saleprice > 0;" || true
             exit 1
           fi
 
