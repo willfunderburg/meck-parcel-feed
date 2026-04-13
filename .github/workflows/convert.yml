@@ -52,12 +52,20 @@ jobs:
 
           echo "Downloaded Parcel_Sales from: ${FOUND_URL}"
           unzip -o data/Parcel_Sales.zip -d data/shp
+          echo "=== Files extracted from ZIP ==="
+          ls -la data/shp/
+          echo "=== All shapefiles found ==="
+          ls data/shp/*.shp 2>/dev/null || echo "(none)"
 
       - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
+          echo "=== Available shapefiles ==="
+          ls -la data/shp/*.shp
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
           echo "Using shapefile: ${SHP_FILE}"
+          echo "=== Shapefile record count ==="
+          ogrinfo -ro -so "$SHP_FILE" | grep -i "feature count" || true
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
       - name: Inspect sales fields
@@ -80,6 +88,69 @@ jobs:
               echo "::warning ::Source dataset appears stale (MAX(saledate)=${MAX_DATE}, ${AGE_DAYS} days old). Proceeding anyway."
             fi
           fi
+
+      - name: Probe REST API for fresh sales data (if ZIP is stale)
+        id: sales_probe
+        run: |
+          set -euo pipefail
+          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate,1,10)) FROM sales;")
+          NOW_UTC=$(date -u +%s)
+          MAX_EPOCH=$(date -u -d "$MAX_DATE" +%s 2>/dev/null || echo 0)
+          AGE_DAYS=$(( (NOW_UTC - MAX_EPOCH) / 86400 ))
+
+          if (( AGE_DAYS <= 90 )); then
+            echo "ZIP data is fresh enough (${AGE_DAYS} days old). Skipping REST probe."
+            echo "use_rest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "ZIP data is ${AGE_DAYS} days stale (max=${MAX_DATE}). Probing REST APIs for fresh sales data..."
+
+          # Endpoints to probe for sales data (layer 2 = Tax Parcels on MAT MapServer)
+          SALES_REST_ENDPOINTS=(
+            "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer/2/query"
+            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/2/query"
+            "https://gis.charlottenc.gov/arcgis/rest/services/CountyData/Parcels/MapServer/0/query"
+          )
+
+          for EP in "${SALES_REST_ENDPOINTS[@]}"; do
+            echo "Probing: ${EP}"
+            if curl -fsSL --max-time 15 \
+              -o data/sales_probe.json \
+              "${EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1"; then
+              PROBE_INFO=$(python3 -c "
+          import json, sys
+          try:
+              d = json.load(open('data/sales_probe.json'))
+              feats = d.get('features', [])
+              if not feats:
+                  print('no_features')
+                  sys.exit(0)
+              fields = list(feats[0].get('attributes', {}).keys())
+              print('Fields: ' + ', '.join(fields))
+              # Check for sales-related fields
+              sales_fields = [f for f in fields if any(kw in f.lower() for kw in ['sale', 'price', 'transfer'])]
+              if sales_fields:
+                  print('SALES_FIELDS: ' + ', '.join(sales_fields))
+              else:
+                  print('NO_SALES_FIELDS')
+          except Exception as e:
+              print('error: ' + str(e))
+          " 2>&1)
+              echo "${PROBE_INFO}"
+              if [[ "${PROBE_INFO}" == *"SALES_FIELDS:"* ]]; then
+                echo "Found REST endpoint with sales data: ${EP}"
+                echo "use_rest=true" >> "$GITHUB_OUTPUT"
+                echo "rest_url=${EP}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            else
+              echo "  (unreachable or error)"
+            fi
+          done
+
+          echo "No REST API with sales fields found. Using ZIP data as-is."
+          echo "use_rest=false" >> "$GITHUB_OUTPUT"
 
       - name: Detect address fields in sales layer
         id: detect_fields
