@@ -68,7 +68,7 @@ jobs:
       - name: Check source staleness (warn-only)
         run: |
           set -euo pipefail
-          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(date(saledate)) FROM sales;")
+          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate, 1, 10)) FROM sales;")
           if [[ -z "${MAX_DATE:-}" || "${MAX_DATE}" == "NULL" ]]; then
             echo "::warning ::Couldn't determine MAX(saledate) from source."
           else
@@ -328,6 +328,8 @@ jobs:
           sqlite3 data/sales.gpkg "PRAGMA table_info(sales);" | cut -d'|' -f2
           SALES_COUNT=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales;")
           echo "Sales row count: ${SALES_COUNT}"
+          echo "=== Sample saledate values ==="
+          sqlite3 data/sales.gpkg "SELECT saledate, typeof(saledate) FROM sales WHERE saledate IS NOT NULL LIMIT 5;"
           if (( SALES_COUNT == 0 )); then
             echo "::error ::Sales table is empty."
             exit 1
@@ -362,12 +364,12 @@ jobs:
                 ${CITY_EXPR} AS city,
                 ${ZIP_EXPR}  AS zipcode
               FROM sales s
-              WHERE date(s.saledate) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= date('now','-12 months')
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
               SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY parcelid ORDER BY date(saledate) DESC
+                PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
               ) AS rn
               FROM recent
             )
@@ -375,10 +377,10 @@ jobs:
               CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
               CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
               pid, parcelid, address, city, zipcode,
-              strftime('%Y-%m-%d', saledate) AS saledate,
+              substr(saledate, 1, 10) AS saledate,
               saleprice
             FROM latest WHERE rn = 1
-            ORDER BY date(saledate) DESC;
+            ORDER BY substr(saledate, 1, 10) DESC;
           SQL
 
           elif [[ "${STRATEGY}" == "needs_mat" && "${MAT_OK}" == "true" ]]; then
@@ -416,13 +418,13 @@ jobs:
                 s.geom, s.parcelid, s.propertyid AS pid,
                 s.saleprice, s.saledate
               FROM sales s
-              WHERE date(s.saledate) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= date('now','-12 months')
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
               SELECT geom, parcelid, pid, saleprice, saledate,
                 ROW_NUMBER() OVER (
-                  PARTITION BY parcelid ORDER BY date(saledate) DESC
+                  PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
                 ) AS rn
               FROM recent
             ),
@@ -449,12 +451,12 @@ jobs:
               COALESCE(j.address, '')  AS address,
               COALESCE(j.city, '')     AS city,
               COALESCE(j.zipcode, '')  AS zipcode,
-              strftime('%Y-%m-%d', b.saledate) AS saledate,
+              substr(b.saledate, 1, 10) AS saledate,
               b.saleprice
             FROM base b
             LEFT JOIN mat_join j
               ON b.parcelid = j.parcelid AND j.addr_rank = 1
-            ORDER BY date(b.saledate) DESC;
+            ORDER BY substr(b.saledate, 1, 10) DESC;
           SQL
 
           else
@@ -465,12 +467,12 @@ jobs:
                 s.geom, s.parcelid, s.propertyid AS pid,
                 s.saleprice, s.saledate
               FROM sales s
-              WHERE date(s.saledate) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= date('now','-12 months')
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
               SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY parcelid ORDER BY date(saledate) DESC
+                PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
               ) AS rn
               FROM recent
             )
@@ -479,10 +481,10 @@ jobs:
               CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
               pid, parcelid,
               '' AS address, '' AS city, '' AS zipcode,
-              strftime('%Y-%m-%d', saledate) AS saledate,
+              substr(saledate, 1, 10) AS saledate,
               saleprice
             FROM latest WHERE rn = 1
-            ORDER BY date(saledate) DESC;
+            ORDER BY substr(saledate, 1, 10) DESC;
           SQL
           fi
 
@@ -503,7 +505,7 @@ jobs:
             cat data/query.sql
             echo ""
             echo "=== Diagnostic: filtered row count ==="
-            sqlite3 data/sales.gpkg "SELECT COUNT(*) AS cnt FROM sales WHERE date(saledate) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;" || true
+            sqlite3 data/sales.gpkg "SELECT COUNT(*) AS cnt FROM sales WHERE substr(saledate, 1, 10) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;" || true
             exit 1
           fi
 
