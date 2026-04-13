@@ -321,13 +321,37 @@ jobs:
           CITY_FIELD="${{ steps.detect_fields.outputs.city_field }}"
           ZIP_FIELD="${{ steps.detect_fields.outputs.zip_field }}"
 
+          # --- Pre-flight diagnostics ---
+          echo "=== GDAL version ==="
+          ogr2ogr --version
+          echo "=== Sales table columns ==="
+          sqlite3 data/sales.gpkg "PRAGMA table_info(sales);" | cut -d'|' -f2
+          SALES_COUNT=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales;")
+          echo "Sales row count: ${SALES_COUNT}"
+          if (( SALES_COUNT == 0 )); then
+            echo "::error ::Sales table is empty."
+            exit 1
+          fi
+          MISSING=""
+          for COL in saledate saleprice parcelid propertyid; do
+            EXISTS=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM pragma_table_info('sales') WHERE lower(name)=lower('${COL}');")
+            if (( EXISTS == 0 )); then MISSING="${MISSING} ${COL}"; fi
+          done
+          if [[ -n "${MISSING}" ]]; then
+            echo "::error ::Sales table missing required columns:${MISSING}"
+            echo "Available columns:"
+            sqlite3 data/sales.gpkg "PRAGMA table_info(sales);"
+            exit 1
+          fi
+          echo "=== Strategy: ${STRATEGY}, MAT available: ${MAT_OK} ==="
+
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || true
 
           if [[ "${STRATEGY}" == "sales_direct" ]]; then
             echo "Using address fields directly from Parcel_Sales layer."
-            ADDR_EXPR="COALESCE(s.${ADDR_FIELD:-NULL}, '')"
-            CITY_EXPR="COALESCE(s.${CITY_FIELD:-NULL}, '')"
-            ZIP_EXPR="COALESCE(s.${ZIP_FIELD:-NULL}, '')"
+            if [[ -n "${ADDR_FIELD}" ]]; then ADDR_EXPR="COALESCE(s.${ADDR_FIELD}, '')"; else ADDR_EXPR="''"; fi
+            if [[ -n "${CITY_FIELD}" ]]; then CITY_EXPR="COALESCE(s.${CITY_FIELD}, '')"; else CITY_EXPR="''"; fi
+            if [[ -n "${ZIP_FIELD}" ]]; then ZIP_EXPR="COALESCE(s.${ZIP_FIELD}, '')"; else ZIP_EXPR="''"; fi
 
             cat > data/query.sql <<SQL
             WITH recent AS (
@@ -466,13 +490,32 @@ jobs:
           cat data/query.sql
           echo ""
 
+          OGR_EXIT=0
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
-            -sql "$(cat data/query.sql)"
+            -sql "$(cat data/query.sql)" || OGR_EXIT=$?
+
+          echo "ogr2ogr exit code: ${OGR_EXIT}"
+
+          if [[ ! -f public/parcel_sales.csv ]]; then
+            echo "::error ::ogr2ogr did not create public/parcel_sales.csv (exit code: ${OGR_EXIT})"
+            echo "=== Query that was attempted ==="
+            cat data/query.sql
+            echo ""
+            echo "=== Diagnostic: filtered row count ==="
+            sqlite3 data/sales.gpkg "SELECT COUNT(*) AS cnt FROM sales WHERE date(saledate) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;" || true
+            exit 1
+          fi
+
+          echo "Output file created: $(wc -l < public/parcel_sales.csv) lines"
 
       - name: Validate output
         run: |
           set -euo pipefail
+          if [[ ! -f public/parcel_sales.csv ]]; then
+            echo "::error ::public/parcel_sales.csv does not exist — Build CSV step failed to produce output."
+            exit 1
+          fi
           ROW_COUNT=$(wc -l < public/parcel_sales.csv)
           echo "Output rows (including header): ${ROW_COUNT}"
           if (( ROW_COUNT < 2 )); then
