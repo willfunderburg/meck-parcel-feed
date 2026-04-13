@@ -330,6 +330,17 @@ jobs:
           echo "Sales row count: ${SALES_COUNT}"
           echo "=== Sample saledate values ==="
           sqlite3 data/sales.gpkg "SELECT saledate, typeof(saledate) FROM sales WHERE saledate IS NOT NULL LIMIT 5;"
+          echo "=== Date range and filter diagnostics ==="
+          sqlite3 data/sales.gpkg "
+            SELECT 'max_saledate' AS metric, MAX(substr(saledate,1,10)) AS value FROM sales
+            UNION ALL SELECT 'min_saledate', MIN(substr(saledate,1,10)) FROM sales
+            UNION ALL SELECT 'date_threshold', date('now','-12 months')
+            UNION ALL SELECT 'rows_date_match', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months')
+            UNION ALL SELECT 'rows_price_gt_0', CAST(COUNT(*) AS TEXT) FROM sales WHERE saleprice IS NOT NULL AND saleprice > 0
+            UNION ALL SELECT 'rows_both_filters', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;
+          "
+          echo "=== Sample recent saleprice values ==="
+          sqlite3 data/sales.gpkg "SELECT substr(saledate,1,10) AS dt, saleprice, typeof(saleprice) FROM sales ORDER BY substr(saledate,1,10) DESC LIMIT 5;"
           if (( SALES_COUNT == 0 )); then
             echo "::error ::Sales table is empty."
             exit 1
