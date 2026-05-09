@@ -69,12 +69,13 @@ jobs:
           print(f"ALL_FIELDS: {', '.join(fields)}", file=sys.stderr)
 
           def find_field(keywords, exclude=None):
-              for f in fields:
-                  fl = f.lower()
-                  if exclude and any(e in fl for e in exclude):
-                      continue
-                  if any(k in fl for k in keywords):
-                      return f
+              for k in keywords:
+                  for f in fields:
+                      fl = f.lower()
+                      if exclude and any(e in fl for e in exclude):
+                          continue
+                      if k in fl:
+                          return f
               return ""
 
           county_field = find_field(['cntyname', 'county_nam', 'county', 'fips'])
@@ -114,7 +115,11 @@ jobs:
           print(f"zip_field={zip_field}")
           print(f"altparcel_field={altparcel_field}")
           print(f"price_is_assessed={price_is_assessed}")
+          sample_price = attrs.get(price_field, None) if price_field else None
+          sample_county = attrs.get(county_field, None) if county_field else None
           print(f"sample_date={sample_date}")
+          print(f"sample_price={sample_price}")
+          print(f"sample_county={sample_county}")
 
           # Verify critical fields exist
           missing = []
@@ -160,7 +165,7 @@ jobs:
 
           # Build WHERE clause
           if [[ -n "${COUNTY_FIELD}" ]]; then
-            WHERE="${COUNTY_FIELD}='MECKLENBURG' AND ${PRICE_FIELD}>0"
+            WHERE="UPPER(${COUNTY_FIELD})='MECKLENBURG' AND ${PRICE_FIELD}>0"
           else
             WHERE="${PRICE_FIELD}>0"
           fi
