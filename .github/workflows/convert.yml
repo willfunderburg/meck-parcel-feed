@@ -21,51 +21,177 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gdal-bin sqlite3 zip unzip curl
 
-      - name: Download and unzip Parcel_Sales
+      - name: Download Parcel_Sales (ZIP or REST API)
         run: |
           set -euo pipefail
           mkdir -p data/shp data/mat public
 
+          # --- Attempt 1: ZIP download ---
           TS="$(date +%s)"
           SALES_URLS=(
             "https://maps.mecklenburgcountync.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
             "https://maps.mecknc.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
           )
 
-          FOUND_URL=""
+          ZIP_OK=false
           for URL in "${SALES_URLS[@]}"; do
-            echo "Trying Parcel_Sales download: ${URL}"
+            echo "Trying Parcel_Sales ZIP: ${URL}"
             if curl -fL --retry 3 --retry-delay 5 \
               -H "Cache-Control: no-cache" \
               -o data/Parcel_Sales.zip \
               "${URL}"; then
-              FOUND_URL="${URL}"
+              echo "Downloaded Parcel_Sales from: ${URL}"
+              unzip -o data/Parcel_Sales.zip -d data/shp
+              echo "=== Files extracted from ZIP ==="
+              ls -la data/shp/
+              ZIP_OK=true
               break
             fi
           done
 
-          if [[ -z "${FOUND_URL}" ]]; then
-            echo "::error ::Parcel_Sales.zip could not be downloaded from any known URL."
-            printf ' - %s\n' "${SALES_URLS[@]}"
+          if [[ "${ZIP_OK}" == "true" ]]; then
+            echo "source=zip" > data/sales_source.txt
+            exit 0
+          fi
+
+          echo "ZIP download failed from all URLs. Searching ArcGIS REST APIs..."
+
+          # --- Attempt 2: Discover sales data via ArcGIS REST API ---
+          ARC_ROOTS=(
+            "https://edmsgis.mecklenburgcountync.gov/server/rest/services"
+            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services"
+          )
+          SERVICE_PATHS=(
+            "GIS/Parcel_Sales/MapServer"
+            "GIS/Parcel_Sales/FeatureServer"
+            "GIS/Property_Sales/MapServer"
+            "GIS/PropertySales/MapServer"
+            "GIS/RealEstate/MapServer"
+            "GIS/Tax_Parcels/MapServer"
+          )
+
+          SALES_EP=""
+          for ROOT in "${ARC_ROOTS[@]}"; do
+            echo "Checking catalog: ${ROOT}"
+            if curl -fsSL --max-time 10 -o data/catalog.json "${ROOT}?f=json" 2>/dev/null; then
+              python3 -c "
+          import json
+          d = json.load(open('data/catalog.json'))
+          for f in d.get('folders', []): print(f'  Folder: {f}')
+          for s in d.get('services', []): print(f'  Service: {s.get(\"name\")}/{s.get(\"type\")}')
+          " 2>/dev/null || true
+            fi
+
+            for SPATH in "${SERVICE_PATHS[@]}"; do
+              URL="${ROOT}/${SPATH}"
+              echo "  Probing: ${URL}"
+              if ! curl -fsSL --max-time 10 -o data/svc_probe.json "${URL}?f=json" 2>/dev/null; then
+                continue
+              fi
+              LAYERS=$(python3 -c "
+          import json
+          d = json.load(open('data/svc_probe.json'))
+          if 'error' in d: exit()
+          for l in d.get('layers', []): print(f\"{l['id']}:{l.get('name','')}\")
+          " 2>/dev/null)
+              [[ -z "${LAYERS}" ]] && continue
+              echo "    Layers: ${LAYERS}"
+
+              while IFS=: read -r LID LNAME; do
+                QUERY_URL="${URL}/${LID}/query"
+                if curl -fsSL --max-time 15 -o data/layer_probe.json \
+                  "${QUERY_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1" 2>/dev/null; then
+                  HAS_SALES=$(python3 -c "
+          import json
+          d = json.load(open('data/layer_probe.json'))
+          feats = d.get('features', [])
+          if not feats: print('no'); exit()
+          flds = list(feats[0].get('attributes', {}).keys())
+          sale = [f for f in flds if any(k in f.lower() for k in ['sale','price','transfer'])]
+          pid = [f for f in flds if any(k in f.lower() for k in ['parcel','pid'])]
+          print('yes' if sale and pid else 'no')
+          " 2>/dev/null)
+                  if [[ "${HAS_SALES}" == "yes" ]]; then
+                    SALES_EP="${QUERY_URL}"
+                    echo "Found sales endpoint: ${SALES_EP} (layer ${LID}: ${LNAME})"
+                    break 3
+                  fi
+                fi
+              done <<< "${LAYERS}"
+            done
+          done
+
+          if [[ -z "${SALES_EP}" ]]; then
+            echo "::error ::No Parcel_Sales source available (ZIP 404, no REST API with sales data found)."
             exit 1
           fi
 
-          echo "Downloaded Parcel_Sales from: ${FOUND_URL}"
-          unzip -o data/Parcel_Sales.zip -d data/shp
-          echo "=== Files extracted from ZIP ==="
-          ls -la data/shp/
-          echo "=== All shapefiles found ==="
-          ls data/shp/*.shp 2>/dev/null || echo "(none)"
+          # --- Paginated REST API download ---
+          echo "Downloading sales data from REST API: ${SALES_EP}"
+          BATCH=2000
+          OFFSET=0
+          TOTAL=0
+
+          while true; do
+            API_URL="${SALES_EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
+            echo "Fetching sales batch: offset=${OFFSET} ..."
+            if ! curl -fL --retry 2 --retry-delay 3 --max-time 120 \
+              -o data/sales_batch.json "${API_URL}"; then
+              echo "::warning ::REST API request failed at offset ${OFFSET}."
+              break
+            fi
+            echo "Response: $(wc -c < data/sales_batch.json) bytes"
+
+            FEAT_COUNT=$(python3 -c "
+          import json, sys
+          try:
+              d = json.load(open('data/sales_batch.json'))
+              if 'error' in d: print('API error: ' + json.dumps(d['error']), file=sys.stderr)
+              print(len(d.get('features', [])))
+          except Exception as e:
+              print(0)
+          ")
+            if (( FEAT_COUNT == 0 )); then
+              echo "No more features. Done."
+              break
+            fi
+
+            if (( TOTAL == 0 )); then
+              ogr2ogr -f GPKG data/sales.gpkg data/sales_batch.json \
+                -t_srs EPSG:4326 -nln sales -overwrite
+            else
+              ogr2ogr -f GPKG data/sales.gpkg data/sales_batch.json \
+                -t_srs EPSG:4326 -nln sales -append
+            fi
+            TOTAL=$((TOTAL + FEAT_COUNT))
+            OFFSET=$((OFFSET + BATCH))
+
+            EXCEEDED=$(python3 -c "
+          import json
+          d = json.load(open('data/sales_batch.json'))
+          print('true' if d.get('exceededTransferLimit', False) else 'false')
+          ")
+            [[ "${EXCEEDED}" != "true" ]] && break
+          done
+
+          echo "Total sales records from REST API: ${TOTAL}"
+          if (( TOTAL == 0 )); then
+            echo "::error ::No sales records loaded."
+            exit 1
+          fi
+          echo "source=rest" > data/sales_source.txt
 
       - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
+          if [[ -f data/sales_source.txt ]] && grep -q "source=rest" data/sales_source.txt; then
+            echo "Sales data already in GPKG from REST API. Skipping reproject."
+            exit 0
+          fi
           echo "=== Available shapefiles ==="
           ls -la data/shp/*.shp
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
           echo "Using shapefile: ${SHP_FILE}"
-          echo "=== Shapefile record count ==="
-          ogrinfo -ro -so "$SHP_FILE" | grep -i "feature count" || true
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
       - name: Inspect sales fields
