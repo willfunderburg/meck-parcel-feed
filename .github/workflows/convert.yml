@@ -52,26 +52,31 @@ jobs:
 
           echo "Downloaded Parcel_Sales from: ${FOUND_URL}"
           unzip -o data/Parcel_Sales.zip -d data/shp
+          echo "=== Files extracted from ZIP ==="
+          ls -la data/shp/
+          echo "=== All shapefiles found ==="
+          ls data/shp/*.shp 2>/dev/null || echo "(none)"
 
       - name: Reproject Parcel_Sales to GPKG (layer 'sales')
         run: |
           set -euo pipefail
+          echo "=== Available shapefiles ==="
+          ls -la data/shp/*.shp
           SHP_FILE=$(ls data/shp/*.shp | head -n 1)
           echo "Using shapefile: ${SHP_FILE}"
+          echo "=== Shapefile record count ==="
+          ogrinfo -ro -so "$SHP_FILE" | grep -i "feature count" || true
           ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
       - name: Inspect sales fields
         run: |
           echo "=== Sales layer schema ==="
           ogrinfo -ro -so -al data/sales.gpkg sales
-          echo ""
-          echo "=== Sample rows (first 3) ==="
-          ogrinfo -ro data/sales.gpkg -sql "SELECT * FROM sales LIMIT 3"
 
       - name: Check source staleness (warn-only)
         run: |
           set -euo pipefail
-          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(date(saledate)) FROM sales;")
+          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate, 1, 10)) FROM sales;")
           if [[ -z "${MAX_DATE:-}" || "${MAX_DATE}" == "NULL" ]]; then
             echo "::warning ::Couldn't determine MAX(saledate) from source."
           else
@@ -84,6 +89,69 @@ jobs:
             fi
           fi
 
+      - name: Probe REST API for fresh sales data (if ZIP is stale)
+        id: sales_probe
+        run: |
+          set -euo pipefail
+          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate,1,10)) FROM sales;")
+          NOW_UTC=$(date -u +%s)
+          MAX_EPOCH=$(date -u -d "$MAX_DATE" +%s 2>/dev/null || echo 0)
+          AGE_DAYS=$(( (NOW_UTC - MAX_EPOCH) / 86400 ))
+
+          if (( AGE_DAYS <= 90 )); then
+            echo "ZIP data is fresh enough (${AGE_DAYS} days old). Skipping REST probe."
+            echo "use_rest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "ZIP data is ${AGE_DAYS} days stale (max=${MAX_DATE}). Probing REST APIs for fresh sales data..."
+
+          # Endpoints to probe for sales data (layer 2 = Tax Parcels on MAT MapServer)
+          SALES_REST_ENDPOINTS=(
+            "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer/2/query"
+            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/2/query"
+            "https://gis.charlottenc.gov/arcgis/rest/services/CountyData/Parcels/MapServer/0/query"
+          )
+
+          for EP in "${SALES_REST_ENDPOINTS[@]}"; do
+            echo "Probing: ${EP}"
+            if curl -fsSL --max-time 15 \
+              -o data/sales_probe.json \
+              "${EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1"; then
+              PROBE_INFO=$(python3 -c "
+          import json, sys
+          try:
+              d = json.load(open('data/sales_probe.json'))
+              feats = d.get('features', [])
+              if not feats:
+                  print('no_features')
+                  sys.exit(0)
+              fields = list(feats[0].get('attributes', {}).keys())
+              print('Fields: ' + ', '.join(fields))
+              # Check for sales-related fields
+              sales_fields = [f for f in fields if any(kw in f.lower() for kw in ['sale', 'price', 'transfer'])]
+              if sales_fields:
+                  print('SALES_FIELDS: ' + ', '.join(sales_fields))
+              else:
+                  print('NO_SALES_FIELDS')
+          except Exception as e:
+              print('error: ' + str(e))
+          " 2>&1)
+              echo "${PROBE_INFO}"
+              if [[ "${PROBE_INFO}" == *"SALES_FIELDS:"* ]]; then
+                echo "Found REST endpoint with sales data: ${EP}"
+                echo "use_rest=true" >> "$GITHUB_OUTPUT"
+                echo "rest_url=${EP}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            else
+              echo "  (unreachable or error)"
+            fi
+          done
+
+          echo "No REST API with sales fields found. Using ZIP data as-is."
+          echo "use_rest=false" >> "$GITHUB_OUTPUT"
+
       - name: Detect address fields in sales layer
         id: detect_fields
         run: |
@@ -91,7 +159,6 @@ jobs:
           FIELDS=$(sqlite3 data/sales.gpkg "PRAGMA table_info(sales);" | cut -d'|' -f2 | tr '\n' ',' )
           echo "Available fields: ${FIELDS}"
 
-          # Check for common address field names (case-insensitive via sqlite)
           HAS_ADDR=$(sqlite3 data/sales.gpkg "
             SELECT COUNT(*) FROM pragma_table_info('sales')
             WHERE lower(name) IN ('site_addr','siteaddres','siteaddress','site_address','address','full_addre','propaddr','location_a','street_add')
@@ -110,7 +177,6 @@ jobs:
           echo "has_zip=${HAS_ZIP}"
 
           if (( HAS_ADDR > 0 )); then
-            # Find the actual field name
             ADDR_FIELD=$(sqlite3 data/sales.gpkg "
               SELECT name FROM pragma_table_info('sales')
               WHERE lower(name) IN ('site_addr','siteaddres','siteaddress','site_address','address','full_addre','propaddr','location_a','street_add')
@@ -135,7 +201,6 @@ jobs:
             echo "zip_field=${ZIP_FIELD}" >> "$GITHUB_OUTPUT"
           fi
 
-          # Determine strategy
           if (( HAS_ADDR > 0 )); then
             echo "strategy=sales_direct" >> "$GITHUB_OUTPUT"
             echo "Address fields found in Parcel_Sales — will use directly (no MAT needed)."
@@ -187,8 +252,9 @@ jobs:
 
           # --- Attempt 2: ArcGIS REST API with pagination ---
           REST_ENDPOINTS=(
-            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/0/query"
             "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer/0/query"
+            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/0/query"
+            "https://gis.charlottenc.gov/arcgis/rest/services/Accela/Accela/MapServer/1/query"
           )
           BATCH=2000
 
@@ -199,7 +265,6 @@ jobs:
             if curl -fsSL --max-time 15 \
               -o data/mat_probe.json \
               "${EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1"; then
-              # Verify it actually returned features
               PROBE_COUNT=$(python3 -c "
           import json
           d = json.load(open('data/mat_probe.json'))
@@ -231,7 +296,6 @@ jobs:
           while true; do
             API_URL="${BASE_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
             echo "Fetching MAT batch: offset=${OFFSET} ..."
-            echo "URL: ${API_URL}"
 
             if ! curl -fL --retry 2 --retry-delay 3 --max-time 60 \
               -o data/mat_batch.json "${API_URL}"; then
@@ -239,10 +303,8 @@ jobs:
               break
             fi
 
-            # Log response size and first 500 chars for debugging
+            # Log response size for debugging
             echo "Response size: $(wc -c < data/mat_batch.json) bytes"
-            head -c 500 data/mat_batch.json
-            echo ""
 
             # Check how many features we got
             FEAT_COUNT=$(python3 -c "
@@ -262,15 +324,8 @@ jobs:
               break
             fi
 
-            # Append batch to GPKG
-            if [[ "${FIRST}" == "true" ]]; then
-              ogr2ogr -f GPKG data/sales.gpkg data/mat_batch.json \
-                -t_srs EPSG:4326 -nln mat -append
-              FIRST=false
-            else
-              ogr2ogr -f GPKG data/sales.gpkg data/mat_batch.json \
-                -t_srs EPSG:4326 -nln mat -append
-            fi
+            ogr2ogr -f GPKG data/sales.gpkg data/mat_batch.json \
+              -t_srs EPSG:4326 -nln mat -append
 
             TOTAL=$((TOTAL + FEAT_COUNT))
             OFFSET=$((OFFSET + BATCH))
@@ -303,7 +358,6 @@ jobs:
           MAT_FIELDS=$(sqlite3 data/sales.gpkg "PRAGMA table_info(mat);" | cut -d'|' -f2 | tr '\n' ',' )
           echo "MAT fields: ${MAT_FIELDS}"
 
-          # Address field
           MAT_ADDR=$(sqlite3 data/sales.gpkg "
             SELECT name FROM pragma_table_info('mat')
             WHERE lower(name) IN ('full_addre','full_address','address','siteaddres','siteaddress','site_addr','site_address','propaddr','street_add','location_a','txt_addres')
@@ -312,7 +366,6 @@ jobs:
           echo "mat_addr_field=${MAT_ADDR:-(none)}"
           echo "mat_addr_field=${MAT_ADDR}" >> "$GITHUB_OUTPUT"
 
-          # City field
           MAT_CITY=$(sqlite3 data/sales.gpkg "
             SELECT name FROM pragma_table_info('mat')
             WHERE lower(name) IN ('nme_city','nme_po_cit','city','city_name','site_city','citydesc','municipali')
@@ -321,7 +374,6 @@ jobs:
           echo "mat_city_field=${MAT_CITY:-(none)}"
           echo "mat_city_field=${MAT_CITY}" >> "$GITHUB_OUTPUT"
 
-          # Zip field
           MAT_ZIP=$(sqlite3 data/sales.gpkg "
             SELECT name FROM pragma_table_info('mat')
             WHERE lower(name) IN ('cde_zip1','zipcode','zip','zip_code','site_zip','postalcode','postal_cod')
@@ -340,13 +392,59 @@ jobs:
           CITY_FIELD="${{ steps.detect_fields.outputs.city_field }}"
           ZIP_FIELD="${{ steps.detect_fields.outputs.zip_field }}"
 
+          # --- Pre-flight diagnostics ---
+          echo "=== GDAL version ==="
+          ogr2ogr --version
+          echo "=== Sales table columns ==="
+          sqlite3 data/sales.gpkg "PRAGMA table_info(sales);" | cut -d'|' -f2
+          SALES_COUNT=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales;")
+          echo "Sales row count: ${SALES_COUNT}"
+          echo "=== Sample saledate values ==="
+          sqlite3 data/sales.gpkg "SELECT saledate, typeof(saledate) FROM sales WHERE saledate IS NOT NULL LIMIT 5;"
+          echo "=== Date range and filter diagnostics ==="
+          sqlite3 data/sales.gpkg "
+            SELECT 'max_saledate' AS metric, MAX(substr(saledate,1,10)) AS value FROM sales
+            UNION ALL SELECT 'min_saledate', MIN(substr(saledate,1,10)) FROM sales
+            UNION ALL SELECT 'date_threshold_now', date('now','-12 months')
+            UNION ALL SELECT 'rows_date_match_now', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months')
+            UNION ALL SELECT 'rows_price_gt_0', CAST(COUNT(*) AS TEXT) FROM sales WHERE saleprice IS NOT NULL AND saleprice > 0
+            UNION ALL SELECT 'rows_both_filters_now', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;
+          "
+          echo "=== Sample recent saleprice values ==="
+          sqlite3 data/sales.gpkg "SELECT substr(saledate,1,10) AS dt, saleprice, typeof(saleprice) FROM sales ORDER BY substr(saledate,1,10) DESC LIMIT 5;"
+          if (( SALES_COUNT == 0 )); then
+            echo "::error ::Sales table is empty."
+            exit 1
+          fi
+          MISSING=""
+          for COL in saledate saleprice parcelid propertyid; do
+            EXISTS=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM pragma_table_info('sales') WHERE lower(name)=lower('${COL}');")
+            if (( EXISTS == 0 )); then MISSING="${MISSING} ${COL}"; fi
+          done
+          if [[ -n "${MISSING}" ]]; then
+            echo "::error ::Sales table missing required columns:${MISSING}"
+            echo "Available columns:"
+            sqlite3 data/sales.gpkg "PRAGMA table_info(sales);"
+            exit 1
+          fi
+          echo "=== Strategy: ${STRATEGY}, MAT available: ${MAT_OK} ==="
+
+          # Compute date cutoff: last 12 months of available data (not from today)
+          MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate,1,10)) FROM sales WHERE saleprice IS NOT NULL AND saleprice > 0;")
+          if [[ -z "${MAX_SALE_DATE}" || "${MAX_SALE_DATE}" == "NULL" ]]; then
+            echo "::error ::No valid sales found in dataset."
+            exit 1
+          fi
+          DATE_CUTOFF=$(sqlite3 data/sales.gpkg "SELECT date('${MAX_SALE_DATE}', '-12 months');")
+          echo "Most recent sale: ${MAX_SALE_DATE}, cutoff (12 months prior): ${DATE_CUTOFF}"
+
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || true
 
           if [[ "${STRATEGY}" == "sales_direct" ]]; then
             echo "Using address fields directly from Parcel_Sales layer."
-            ADDR_EXPR="COALESCE(s.${ADDR_FIELD:-NULL}, '')"
-            CITY_EXPR="COALESCE(s.${CITY_FIELD:-NULL}, '')"
-            ZIP_EXPR="COALESCE(s.${ZIP_FIELD:-NULL}, '')"
+            if [[ -n "${ADDR_FIELD}" ]]; then ADDR_EXPR="COALESCE(s.${ADDR_FIELD}, '')"; else ADDR_EXPR="''"; fi
+            if [[ -n "${CITY_FIELD}" ]]; then CITY_EXPR="COALESCE(s.${CITY_FIELD}, '')"; else CITY_EXPR="''"; fi
+            if [[ -n "${ZIP_FIELD}" ]]; then ZIP_EXPR="COALESCE(s.${ZIP_FIELD}, '')"; else ZIP_EXPR="''"; fi
 
             cat > data/query.sql <<SQL
             WITH recent AS (
@@ -357,12 +455,12 @@ jobs:
                 ${CITY_EXPR} AS city,
                 ${ZIP_EXPR}  AS zipcode
               FROM sales s
-              WHERE date(s.saledate) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
               SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY parcelid ORDER BY date(saledate) DESC
+                PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
               ) AS rn
               FROM recent
             )
@@ -370,10 +468,10 @@ jobs:
               CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
               CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
               pid, parcelid, address, city, zipcode,
-              strftime('%Y-%m-%d', saledate) AS saledate,
+              substr(saledate, 1, 10) AS saledate,
               saleprice
             FROM latest WHERE rn = 1
-            ORDER BY date(saledate) DESC;
+            ORDER BY substr(saledate, 1, 10) DESC;
           SQL
 
           elif [[ "${STRATEGY}" == "needs_mat" && "${MAT_OK}" == "true" ]]; then
@@ -411,13 +509,13 @@ jobs:
                 s.geom, s.parcelid, s.propertyid AS pid,
                 s.saleprice, s.saledate
               FROM sales s
-              WHERE date(s.saledate) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
               SELECT geom, parcelid, pid, saleprice, saledate,
                 ROW_NUMBER() OVER (
-                  PARTITION BY parcelid ORDER BY date(saledate) DESC
+                  PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
                 ) AS rn
               FROM recent
             ),
@@ -444,28 +542,28 @@ jobs:
               COALESCE(j.address, '')  AS address,
               COALESCE(j.city, '')     AS city,
               COALESCE(j.zipcode, '')  AS zipcode,
-              strftime('%Y-%m-%d', b.saledate) AS saledate,
+              substr(b.saledate, 1, 10) AS saledate,
               b.saleprice
             FROM base b
             LEFT JOIN mat_join j
               ON b.parcelid = j.parcelid AND j.addr_rank = 1
-            ORDER BY date(b.saledate) DESC;
+            ORDER BY substr(b.saledate, 1, 10) DESC;
           SQL
 
           else
             echo "::warning ::No address source available — address/city/zipcode will be empty."
-            cat > data/query.sql <<'SQL'
+            cat > data/query.sql <<SQL
             WITH recent AS (
               SELECT
                 s.geom, s.parcelid, s.propertyid AS pid,
                 s.saleprice, s.saledate
               FROM sales s
-              WHERE date(s.saledate) >= date('now','-12 months')
+              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
                 AND s.saleprice IS NOT NULL AND s.saleprice > 0
             ),
             latest AS (
               SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY parcelid ORDER BY date(saledate) DESC
+                PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
               ) AS rn
               FROM recent
             )
@@ -474,10 +572,10 @@ jobs:
               CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
               pid, parcelid,
               '' AS address, '' AS city, '' AS zipcode,
-              strftime('%Y-%m-%d', saledate) AS saledate,
+              substr(saledate, 1, 10) AS saledate,
               saleprice
             FROM latest WHERE rn = 1
-            ORDER BY date(saledate) DESC;
+            ORDER BY substr(saledate, 1, 10) DESC;
           SQL
           fi
 
@@ -485,20 +583,38 @@ jobs:
           cat data/query.sql
           echo ""
 
+          OGR_EXIT=0
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
-            -sql "$(cat data/query.sql)"
+            -sql "$(cat data/query.sql)" || OGR_EXIT=$?
+
+          echo "ogr2ogr exit code: ${OGR_EXIT}"
+
+          if [[ ! -f public/parcel_sales.csv ]]; then
+            echo "::error ::ogr2ogr did not create public/parcel_sales.csv (exit code: ${OGR_EXIT})"
+            echo "=== Query that was attempted ==="
+            cat data/query.sql
+            echo ""
+            echo "=== Diagnostic: filtered row count ==="
+            sqlite3 data/sales.gpkg "SELECT COUNT(*) AS cnt FROM sales WHERE substr(saledate, 1, 10) >= '${DATE_CUTOFF}' AND saleprice IS NOT NULL AND saleprice > 0;" || true
+            exit 1
+          fi
+
+          echo "Output file created: $(wc -l < public/parcel_sales.csv) lines"
 
       - name: Validate output
         run: |
           set -euo pipefail
+          if [[ ! -f public/parcel_sales.csv ]]; then
+            echo "::error ::public/parcel_sales.csv does not exist — Build CSV step failed to produce output."
+            exit 1
+          fi
           ROW_COUNT=$(wc -l < public/parcel_sales.csv)
           echo "Output rows (including header): ${ROW_COUNT}"
           if (( ROW_COUNT < 2 )); then
             echo "::error ::Output CSV is empty — something went wrong with the query."
             exit 1
           fi
-          # Check if addresses are populated
           ADDR_FILLED=$(awk -F',' 'NR>1 && $5!="" {count++} END {print count+0}' public/parcel_sales.csv)
           TOTAL=$((ROW_COUNT - 1))
           echo "Rows with address data: ${ADDR_FILLED}/${TOTAL}"
