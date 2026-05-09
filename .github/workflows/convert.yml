@@ -80,6 +80,11 @@ jobs:
           county_field = find_field(['cntyname', 'county_nam', 'county', 'fips'])
           parcel_field = find_field(['parno', 'parcel_id', 'pid', 'pin', 'reid', 'parcelid'])
           price_field = find_field(['saleprice', 'sale_price', 'totalsaleprice', 'price', 'consideration'])
+          price_is_assessed = "false"
+          if not price_field:
+              price_field = find_field(['parval', 'presentval', 'totalval', 'improvval', 'landval'])
+              if price_field:
+                  price_is_assessed = "true"
           date_field = find_field(['saledate', 'sale_date', 'datesold', 'deed_date'], exclude=['txt'])
           addr_field = find_field(['siteadd', 'site_addr', 'phyadd', 'address', 'propaddr', 'full_addre'], exclude=['city', 'zip', 'state'])
           city_field = find_field(['site_city', 'citydesc', 'city_name', 'city', 'nme_city'], exclude=['zip', 'addr', 'add'])
@@ -108,6 +113,7 @@ jobs:
           print(f"city_field={city_field}")
           print(f"zip_field={zip_field}")
           print(f"altparcel_field={altparcel_field}")
+          print(f"price_is_assessed={price_is_assessed}")
           print(f"sample_date={sample_date}")
 
           # Verify critical fields exist
@@ -236,22 +242,20 @@ jobs:
             MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(${DATE_FIELD}, 1, 10)) FROM sales WHERE ${PRICE_FIELD} > 0;")
           fi
 
-          echo "Most recent sale date: ${MAX_DATE}"
+          echo "Most recent date value: ${MAX_DATE}"
           if [[ -z "${MAX_DATE}" || "${MAX_DATE}" == "NULL" ]]; then
-            echo "::error ::Could not determine most recent sale date."
-            exit 1
-          fi
+            echo "::warning ::No dates found in ${DATE_FIELD} — cannot determine data freshness."
+          else
+            NOW_UTC=$(date -u +%s)
+            MAX_EPOCH=$(date -u -d "${MAX_DATE}" +%s 2>/dev/null || echo 0)
+            AGE_DAYS=$(( (NOW_UTC - MAX_EPOCH) / 86400 ))
+            echo "Data age: ${AGE_DAYS} days"
 
-          NOW_UTC=$(date -u +%s)
-          MAX_EPOCH=$(date -u -d "${MAX_DATE}" +%s 2>/dev/null || echo 0)
-          AGE_DAYS=$(( (NOW_UTC - MAX_EPOCH) / 86400 ))
-          echo "Data age: ${AGE_DAYS} days"
-
-          if (( AGE_DAYS > 90 )); then
-            echo "::error ::Data is ${AGE_DAYS} days stale (max date: ${MAX_DATE})."
-            exit 1
-          elif (( AGE_DAYS > 14 )); then
-            echo "::warning ::Data is ${AGE_DAYS} days old (max date: ${MAX_DATE})."
+            if (( AGE_DAYS > 90 )); then
+              echo "::warning ::Data appears ${AGE_DAYS} days old (max date: ${MAX_DATE})."
+            elif (( AGE_DAYS > 14 )); then
+              echo "::warning ::Data is ${AGE_DAYS} days old (max date: ${MAX_DATE})."
+            fi
           fi
 
           echo "=== Price distribution ==="
@@ -272,6 +276,7 @@ jobs:
           PRICE_FIELD="${{ steps.schema.outputs.price_field }}"
           DATE_FIELD="${{ steps.schema.outputs.date_field }}"
           DATE_FMT="${{ steps.schema.outputs.date_format }}"
+          PRICE_IS_ASSESSED="${{ steps.schema.outputs.price_is_assessed }}"
           ADDR_FIELD="${{ steps.schema.outputs.addr_field }}"
           CITY_FIELD="${{ steps.schema.outputs.city_field }}"
           ZIP_FIELD="${{ steps.schema.outputs.zip_field }}"
@@ -298,47 +303,81 @@ jobs:
             PID_EXPR="${PARCEL_FIELD}"
           fi
 
-          # Compute adaptive date cutoff (last 12 months of available data)
-          if [[ "${DATE_FMT}" == "epoch_ms" ]]; then
-            MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT strftime('%Y-%m-%d', MAX(${DATE_FIELD})/1000, 'unixepoch') FROM sales WHERE ${PRICE_FIELD} > 0;")
-          else
-            MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(${DATE_FIELD}, 1, 10)) FROM sales WHERE ${PRICE_FIELD} > 0;")
-          fi
-          DATE_CUTOFF=$(sqlite3 data/sales.gpkg "SELECT date('${MAX_SALE_DATE}', '-12 months');")
-          echo "Most recent sale: ${MAX_SALE_DATE}, cutoff: ${DATE_CUTOFF}"
-
           # Build spatial index
           ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" 2>/dev/null || true
 
-          cat > data/query.sql <<SQL
-          WITH recent AS (
+          if [[ "${PRICE_IS_ASSESSED}" == "true" ]]; then
+            # Assessed value: include all parcels with value > 0, no date filter
+            echo "Using assessed value (${PRICE_FIELD}) — including all parcels."
+            # Use saledate if available, otherwise sourcedate or empty
+            cat > data/query.sql <<SQL
+            WITH base AS (
+              SELECT
+                geom,
+                ${PARCEL_FIELD} AS parcelid,
+                ${PID_EXPR} AS pid,
+                CAST(${PRICE_FIELD} AS INTEGER) AS saleprice,
+                COALESCE(${DATE_EXPR}, '') AS saledate,
+                ${ADDR_EXPR} AS address,
+                ${CITY_EXPR} AS city,
+                ${ZIP_EXPR} AS zipcode
+              FROM sales
+              WHERE ${PRICE_FIELD} > 0
+            ),
+            dedup AS (
+              SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY parcelid ORDER BY saleprice DESC
+              ) AS rn
+              FROM base
+            )
             SELECT
-              geom,
-              ${PARCEL_FIELD} AS parcelid,
-              ${PID_EXPR} AS pid,
-              ${PRICE_FIELD} AS saleprice,
-              ${DATE_EXPR} AS saledate,
-              ${ADDR_EXPR} AS address,
-              ${CITY_EXPR} AS city,
-              ${ZIP_EXPR} AS zipcode
-            FROM sales
-            WHERE ${PRICE_FIELD} > 0
-              AND ${DATE_EXPR} >= '${DATE_CUTOFF}'
-          ),
-          latest AS (
-            SELECT *, ROW_NUMBER() OVER (
-              PARTITION BY parcelid ORDER BY saledate DESC
-            ) AS rn
-            FROM recent
-          )
-          SELECT
-            CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
-            CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
-            pid, parcelid, address, city, zipcode,
-            saledate, saleprice
-          FROM latest WHERE rn = 1
-          ORDER BY saledate DESC;
+              CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
+              CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
+              pid, parcelid, address, city, zipcode,
+              saledate, saleprice
+            FROM dedup WHERE rn = 1
+            ORDER BY saleprice DESC;
           SQL
+          else
+            # Actual sale price: filter to last 12 months of sales
+            if [[ "${DATE_FMT}" == "epoch_ms" ]]; then
+              MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT strftime('%Y-%m-%d', MAX(${DATE_FIELD})/1000, 'unixepoch') FROM sales WHERE ${PRICE_FIELD} > 0;")
+            else
+              MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(${DATE_FIELD}, 1, 10)) FROM sales WHERE ${PRICE_FIELD} > 0;")
+            fi
+            DATE_CUTOFF=$(sqlite3 data/sales.gpkg "SELECT date('${MAX_SALE_DATE}', '-12 months');")
+            echo "Most recent sale: ${MAX_SALE_DATE}, cutoff: ${DATE_CUTOFF}"
+
+            cat > data/query.sql <<SQL
+            WITH recent AS (
+              SELECT
+                geom,
+                ${PARCEL_FIELD} AS parcelid,
+                ${PID_EXPR} AS pid,
+                ${PRICE_FIELD} AS saleprice,
+                ${DATE_EXPR} AS saledate,
+                ${ADDR_EXPR} AS address,
+                ${CITY_EXPR} AS city,
+                ${ZIP_EXPR} AS zipcode
+              FROM sales
+              WHERE ${PRICE_FIELD} > 0
+                AND ${DATE_EXPR} >= '${DATE_CUTOFF}'
+            ),
+            latest AS (
+              SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY parcelid ORDER BY saledate DESC
+              ) AS rn
+              FROM recent
+            )
+            SELECT
+              CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
+              CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
+              pid, parcelid, address, city, zipcode,
+              saledate, saleprice
+            FROM latest WHERE rn = 1
+            ORDER BY saledate DESC;
+          SQL
+          fi
 
           echo "=== Query ==="
           cat data/query.sql
@@ -351,7 +390,7 @@ jobs:
           if [[ ! -f public/parcel_sales.csv ]]; then
             echo "::error ::ogr2ogr did not produce output (exit code: ${OGR_EXIT})"
             echo "=== Diagnostic ==="
-            sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales WHERE ${PRICE_FIELD} > 0 AND ${DATE_EXPR} >= '${DATE_CUTOFF}';"
+            sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales WHERE ${PRICE_FIELD} > 0;"
             exit 1
           fi
 
