@@ -57,72 +57,100 @@ jobs:
           echo "ZIP download failed from all URLs. Searching ArcGIS REST APIs..."
 
           # --- Attempt 2: Discover sales data via ArcGIS REST API ---
+          # Dynamically enumerate all services in relevant folders
           ARC_ROOTS=(
             "https://edmsgis.mecklenburgcountync.gov/server/rest/services"
             "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services"
+            "https://gis.charlottenc.gov/arcgis/rest/services"
           )
-          SERVICE_PATHS=(
-            "GIS/Parcel_Sales/MapServer"
-            "GIS/Parcel_Sales/FeatureServer"
-            "GIS/Property_Sales/MapServer"
-            "GIS/PropertySales/MapServer"
-            "GIS/RealEstate/MapServer"
-            "GIS/Tax_Parcels/MapServer"
-          )
+          FOLDERS_TO_SEARCH=("" "GIS" "CountyData" "OpenData" "Property" "Tax")
 
           SALES_EP=""
           for ROOT in "${ARC_ROOTS[@]}"; do
-            echo "Checking catalog: ${ROOT}"
-            if curl -fsSL --max-time 10 -o data/catalog.json "${ROOT}?f=json" 2>/dev/null; then
-              python3 -c "
-          import json
-          d = json.load(open('data/catalog.json'))
-          for f in d.get('folders', []): print(f'  Folder: {f}')
-          for s in d.get('services', []): print(f'  Service: {s.get(\"name\")}/{s.get(\"type\")}')
-          " 2>/dev/null || true
-            fi
-
-            for SPATH in "${SERVICE_PATHS[@]}"; do
-              URL="${ROOT}/${SPATH}"
-              echo "  Probing: ${URL}"
-              if ! curl -fsSL --max-time 10 -o data/svc_probe.json "${URL}?f=json" 2>/dev/null; then
+            echo "=== Checking server: ${ROOT} ==="
+            for FOLDER in "${FOLDERS_TO_SEARCH[@]}"; do
+              if [[ -n "${FOLDER}" ]]; then
+                CATALOG_URL="${ROOT}/${FOLDER}?f=json"
+              else
+                CATALOG_URL="${ROOT}?f=json"
+              fi
+              echo "  Listing folder: ${FOLDER:-(root)}"
+              if ! curl -fsSL --max-time 10 -o data/catalog.json "${CATALOG_URL}" 2>/dev/null; then
                 continue
               fi
-              LAYERS=$(python3 -c "
+
+              SERVICES=$(python3 -c "
+          import json
+          d = json.load(open('data/catalog.json'))
+          if 'error' in d:
+              exit()
+          for f in d.get('folders', []):
+              print(f'FOLDER:{f}')
+          for s in d.get('services', []):
+              n = s.get('name','')
+              t = s.get('type','')
+              print(f'SVC:{n}/{t}')
+          " 2>/dev/null)
+              [[ -z "${SERVICES}" ]] && continue
+              echo "${SERVICES}" | head -30
+
+              while IFS= read -r LINE; do
+                [[ "${LINE}" != SVC:* ]] && continue
+                SVC_PATH="${LINE#SVC:}"
+                SVC_URL="${ROOT}/${SVC_PATH}"
+                SVC_NAME_LOWER=$(echo "${SVC_PATH}" | tr '[:upper:]' '[:lower:]')
+
+                if [[ "${SVC_NAME_LOWER}" != *parcel* && "${SVC_NAME_LOWER}" != *sale* && \
+                      "${SVC_NAME_LOWER}" != *propert* && "${SVC_NAME_LOWER}" != *tax* && \
+                      "${SVC_NAME_LOWER}" != *real* && "${SVC_NAME_LOWER}" != *cama* ]]; then
+                  continue
+                fi
+                echo "    Probing service: ${SVC_URL}"
+                if ! curl -fsSL --max-time 10 -o data/svc_probe.json "${SVC_URL}?f=json" 2>/dev/null; then
+                  continue
+                fi
+                LAYERS=$(python3 -c "
           import json
           d = json.load(open('data/svc_probe.json'))
           if 'error' in d: exit()
-          for l in d.get('layers', []): print(f\"{l['id']}:{l.get('name','')}\")
+          for l in d.get('layers', []):
+              print(f\"{l['id']}:{l.get('name','')}\")
           " 2>/dev/null)
-              [[ -z "${LAYERS}" ]] && continue
-              echo "    Layers: ${LAYERS}"
+                [[ -z "${LAYERS}" ]] && continue
+                echo "      Layers: ${LAYERS}"
 
-              while IFS=: read -r LID LNAME; do
-                QUERY_URL="${URL}/${LID}/query"
-                if curl -fsSL --max-time 15 -o data/layer_probe.json \
-                  "${QUERY_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1" 2>/dev/null; then
-                  HAS_SALES=$(python3 -c "
+                while IFS=: read -r LID LNAME; do
+                  QUERY_URL="${SVC_URL}/${LID}/query"
+                  if curl -fsSL --max-time 15 -o data/layer_probe.json \
+                    "${QUERY_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1" 2>/dev/null; then
+                    HAS_SALES=$(python3 -c "
           import json
           d = json.load(open('data/layer_probe.json'))
           feats = d.get('features', [])
           if not feats: print('no'); exit()
           flds = list(feats[0].get('attributes', {}).keys())
-          sale = [f for f in flds if any(k in f.lower() for k in ['sale','price','transfer'])]
-          pid = [f for f in flds if any(k in f.lower() for k in ['parcel','pid'])]
+          print('Fields: ' + ', '.join(flds[:20]))
+          sale = [f for f in flds if any(k in f.lower() for k in ['sale','price','transfer','deed'])]
+          pid = [f for f in flds if any(k in f.lower() for k in ['parcel','pid','pin'])]
+          if sale: print('Sale fields: ' + ', '.join(sale))
+          if pid: print('Parcel fields: ' + ', '.join(pid))
           print('yes' if sale and pid else 'no')
           " 2>/dev/null)
-                  if [[ "${HAS_SALES}" == "yes" ]]; then
-                    SALES_EP="${QUERY_URL}"
-                    echo "Found sales endpoint: ${SALES_EP} (layer ${LID}: ${LNAME})"
-                    break 3
+                    echo "      Layer ${LID} (${LNAME}): ${HAS_SALES}"
+                    if [[ "${HAS_SALES}" == *$'\n'"yes" || "${HAS_SALES}" == "yes" ]]; then
+                      SALES_EP="${QUERY_URL}"
+                      echo "Found sales endpoint: ${SALES_EP} (layer ${LID}: ${LNAME})"
+                      break 4
+                    fi
                   fi
-                fi
-              done <<< "${LAYERS}"
+                done <<< "${LAYERS}"
+              done <<< "${SERVICES}"
             done
           done
 
           if [[ -z "${SALES_EP}" ]]; then
             echo "::error ::No Parcel_Sales source available (ZIP 404, no REST API with sales data found)."
+            echo "Searched ${#ARC_ROOTS[@]} servers x ${#FOLDERS_TO_SEARCH[@]} folders."
             exit 1
           fi
 
