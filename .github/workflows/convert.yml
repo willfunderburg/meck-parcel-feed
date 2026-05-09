@@ -148,9 +148,156 @@ jobs:
             done
           done
 
+          # --- Attempt 3: Deep-probe known services for sales sub-layers ---
           if [[ -z "${SALES_EP}" ]]; then
-            echo "::error ::No Parcel_Sales source available (ZIP 404, no REST API with sales data found)."
-            echo "Searched ${#ARC_ROOTS[@]} servers x ${#FOLDERS_TO_SEARCH[@]} folders."
+            echo "=== Deep-probing known services for sales sub-layers ==="
+
+            DEEP_PROBE_URLS=(
+              "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer"
+              "https://gis.charlottenc.gov/arcgis/rest/services/CountyData/Parcels/MapServer"
+              "https://gis.charlottenc.gov/arcgis/rest/services/Accela/Accela/MapServer"
+            )
+            for SVC_URL in "${DEEP_PROBE_URLS[@]}"; do
+              echo "  Deep-probing: ${SVC_URL}"
+              if ! curl -fsSL --max-time 10 -o data/svc_probe.json "${SVC_URL}?f=json" 2>/dev/null; then
+                echo "    (unreachable)"
+                continue
+              fi
+              ALL_LAYERS=$(python3 -c "
+          import json
+          d = json.load(open('data/svc_probe.json'))
+          if 'error' in d: exit()
+          for l in d.get('layers', []):
+              print(f\"{l['id']}:{l.get('name','')}\")
+          for t in d.get('tables', []):
+              print(f\"{t['id']}:{t.get('name','')}:TABLE\")
+          " 2>/dev/null)
+              [[ -z "${ALL_LAYERS}" ]] && continue
+              echo "    All layers/tables: ${ALL_LAYERS}"
+
+              while IFS=: read -r LID LNAME LTYPE; do
+                QUERY_URL="${SVC_URL}/${LID}/query"
+                if curl -fsSL --max-time 15 -o data/layer_probe.json \
+                  "${QUERY_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1" 2>/dev/null; then
+                  PROBE_RESULT=$(python3 -c "
+          import json
+          d = json.load(open('data/layer_probe.json'))
+          feats = d.get('features', [])
+          if not feats: print('no_features'); exit()
+          flds = list(feats[0].get('attributes', {}).keys())
+          print('ALL_FIELDS: ' + ', '.join(flds))
+          sale = [f for f in flds if any(k in f.lower() for k in ['sale','price','transfer','deed','amount','consider'])]
+          pid = [f for f in flds if any(k in f.lower() for k in ['parcel','pid','pin'])]
+          if sale: print('SALE_FIELDS: ' + ', '.join(sale))
+          if pid: print('PARCEL_FIELDS: ' + ', '.join(pid))
+          print('MATCH' if sale and pid else 'NO_MATCH')
+          " 2>/dev/null)
+                  echo "    Layer ${LID} (${LNAME}): $(echo "${PROBE_RESULT}" | tail -1)"
+                  if [[ "${PROBE_RESULT}" == *"ALL_FIELDS:"* ]]; then
+                    echo "      $(echo "${PROBE_RESULT}" | grep 'ALL_FIELDS:')"
+                  fi
+                  if [[ "${PROBE_RESULT}" == *"MATCH" ]]; then
+                    SALES_EP="${QUERY_URL}"
+                    echo "Found sales endpoint: ${SALES_EP}"
+                    break 2
+                  fi
+                fi
+              done <<< "${ALL_LAYERS}"
+            done
+          fi
+
+          # --- Attempt 4: Check opendata directory for renamed files ---
+          if [[ -z "${SALES_EP}" ]]; then
+            echo "=== Checking opendata directory for available files ==="
+            for DIR_URL in \
+              "https://maps.mecklenburgcountync.gov/opendata/" \
+              "https://edmsgis.mecklenburgcountync.gov/opendata/"; do
+              echo "  Listing: ${DIR_URL}"
+              if curl -fsSL --max-time 10 -o data/dir_listing.html "${DIR_URL}" 2>/dev/null; then
+                python3 -c "
+          import re
+          html = open('data/dir_listing.html').read()
+          links = re.findall(r'href=[\"'\'']([^\"'\'']*\.(zip|csv|geojson|gpkg|shp))[\"'\'']', html, re.I)
+          for link, ext in links:
+              print(f'  File: {link}')
+          if not links:
+              # Just show the raw text for debugging
+              text = re.sub(r'<[^>]+>', ' ', html)
+              text = ' '.join(text.split())[:500]
+              print(f'  Raw: {text}')
+          " 2>/dev/null || true
+              fi
+            done
+
+            # Also try specific alternate filenames
+            ALTERNATE_NAMES=(
+              "Parcel_Sales_Data.zip"
+              "ParcelSales.zip"
+              "Property_Sales.zip"
+              "Real_Estate_Sales.zip"
+              "Tax_Parcels.zip"
+              "Parcels.zip"
+            )
+            for ALT in "${ALTERNATE_NAMES[@]}"; do
+              ALT_URL="https://maps.mecklenburgcountync.gov/opendata/${ALT}?nocache=${TS}"
+              HTTP_CODE=$(curl -sL -o /dev/null -w "%{http_code}" --max-time 10 "${ALT_URL}" 2>/dev/null || echo "000")
+              if [[ "${HTTP_CODE}" == "200" ]]; then
+                echo "Found alternate file: ${ALT_URL} (HTTP ${HTTP_CODE})"
+                curl -fL --retry 2 -o data/Parcel_Sales.zip "${ALT_URL}"
+                unzip -o data/Parcel_Sales.zip -d data/shp
+                ls -la data/shp/
+                echo "source=zip" > data/sales_source.txt
+                SALES_EP="found_zip"
+                break
+              else
+                echo "  ${ALT}: HTTP ${HTTP_CODE}"
+              fi
+            done
+          fi
+
+          # --- Attempt 5: Try Charlotte/Mecklenburg Open Data Hub ---
+          if [[ -z "${SALES_EP}" ]]; then
+            echo "=== Checking ArcGIS Hub / Open Data portals ==="
+            HUB_SEARCH_URLS=(
+              "https://opendata.charlottenc.gov/api/v3/datasets?filter[tags]=parcel,sales&page[size]=5"
+              "https://data-mecklenburgcounty.opendata.arcgis.com/api/v3/datasets?q=parcel+sales&page[size]=5"
+              "https://hub.arcgis.com/api/v3/datasets?filter[source]=Mecklenburg&q=parcel+sales&page[size]=5"
+            )
+            for HUB_URL in "${HUB_SEARCH_URLS[@]}"; do
+              echo "  Searching: ${HUB_URL}"
+              if curl -fsSL --max-time 15 -o data/hub_result.json "${HUB_URL}" 2>/dev/null; then
+                python3 -c "
+          import json
+          d = json.load(open('data/hub_result.json'))
+          items = d.get('data', [])
+          for item in items[:5]:
+              attrs = item.get('attributes', {})
+              name = attrs.get('name', 'unknown')
+              url = attrs.get('url', '')
+              print(f'  Dataset: {name} -> {url}')
+          if not items:
+              print('  (no results)')
+          " 2>/dev/null || echo "  (parse error)"
+              else
+                echo "  (unreachable)"
+              fi
+            done
+          fi
+
+          if [[ -z "${SALES_EP}" ]]; then
+            echo ""
+            echo "============================================================"
+            echo "SUMMARY: All data sources exhausted."
+            echo "  - Parcel_Sales.zip: 404 from all known URLs"
+            echo "  - ArcGIS REST services: no sales data found"
+            echo "  - edmsgis GIS folder: only GIS/MAT/MapServer"
+            echo "  - Alternate filenames: not found"
+            echo "  - Open Data Hub: no results"
+            echo ""
+            echo "The county appears to have removed Parcel_Sales from"
+            echo "all public endpoints. Manual investigation needed."
+            echo "============================================================"
+            echo "::error ::No Parcel_Sales source available. See logs above for full diagnostic."
             exit 1
           fi
 
