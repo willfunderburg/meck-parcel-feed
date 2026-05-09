@@ -19,176 +19,181 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y gdal-bin sqlite3 zip unzip curl
+          sudo apt-get install -y gdal-bin sqlite3 curl
 
-      - name: Download Parcel_Sales (ZIP or REST API)
+      - name: Discover NC OneMap schema
+        id: schema
         run: |
           set -euo pipefail
-          mkdir -p data/shp data/mat public
+          mkdir -p data public
 
-          # --- Attempt 1: ZIP download ---
-          TS="$(date +%s)"
-          SALES_URLS=(
-            "https://maps.mecklenburgcountync.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
-            "https://maps.mecknc.gov/opendata/Parcel_Sales.zip?nocache=${TS}"
+          BASE_URLS=(
+            "https://services.nconemap.gov/secure/rest/services/NC1Map_Parcels/MapServer"
+            "https://services.gis.nc.gov/secure/rest/services/NC1Map_Parcels/MapServer"
           )
 
-          ZIP_OK=false
-          for URL in "${SALES_URLS[@]}"; do
-            echo "Trying Parcel_Sales ZIP: ${URL}"
-            if curl -fL --retry 3 --retry-delay 5 \
-              -H "Cache-Control: no-cache" \
-              -o data/Parcel_Sales.zip \
-              "${URL}"; then
-              echo "Downloaded Parcel_Sales from: ${URL}"
-              unzip -o data/Parcel_Sales.zip -d data/shp
-              echo "=== Files extracted from ZIP ==="
-              ls -la data/shp/
-              ZIP_OK=true
-              break
-            fi
-          done
-
-          if [[ "${ZIP_OK}" == "true" ]]; then
-            echo "source=zip" > data/sales_source.txt
-            exit 0
-          fi
-
-          echo "ZIP download failed from all URLs. Searching ArcGIS REST APIs..."
-
-          # --- Attempt 2: Discover sales data via ArcGIS REST API ---
-          # Dynamically enumerate all services in relevant folders
-          ARC_ROOTS=(
-            "https://edmsgis.mecklenburgcountync.gov/server/rest/services"
-            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services"
-            "https://gis.charlottenc.gov/arcgis/rest/services"
-          )
-          FOLDERS_TO_SEARCH=("" "GIS" "CountyData" "OpenData" "Property" "Tax")
-
-          SALES_EP=""
-          for ROOT in "${ARC_ROOTS[@]}"; do
-            echo "=== Checking server: ${ROOT} ==="
-            for FOLDER in "${FOLDERS_TO_SEARCH[@]}"; do
-              if [[ -n "${FOLDER}" ]]; then
-                CATALOG_URL="${ROOT}/${FOLDER}?f=json"
-              else
-                CATALOG_URL="${ROOT}?f=json"
-              fi
-              echo "  Listing folder: ${FOLDER:-(root)}"
-              if ! curl -fsSL --max-time 10 -o data/catalog.json "${CATALOG_URL}" 2>/dev/null; then
-                continue
-              fi
-
-              SERVICES=$(python3 -c "
+          # Find a reachable server and working layer
+          LAYER_URL=""
+          for BASE in "${BASE_URLS[@]}"; do
+            for LID in 1 0; do
+              PROBE_URL="${BASE}/${LID}/query?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1"
+              echo "Probing: ${BASE}/${LID}"
+              if curl -fsSL --max-time 20 -o data/probe.json "${PROBE_URL}" 2>/dev/null; then
+                FEAT_COUNT=$(python3 -c "
           import json
-          d = json.load(open('data/catalog.json'))
-          if 'error' in d:
-              exit()
-          for f in d.get('folders', []):
-              print(f'FOLDER:{f}')
-          for s in d.get('services', []):
-              n = s.get('name','')
-              t = s.get('type','')
-              print(f'SVC:{n}/{t}')
-          " 2>/dev/null)
-              [[ -z "${SERVICES}" ]] && continue
-              echo "${SERVICES}" | head -30
-
-              while IFS= read -r LINE; do
-                [[ "${LINE}" != SVC:* ]] && continue
-                SVC_PATH="${LINE#SVC:}"
-                SVC_URL="${ROOT}/${SVC_PATH}"
-                SVC_NAME_LOWER=$(echo "${SVC_PATH}" | tr '[:upper:]' '[:lower:]')
-
-                if [[ "${SVC_NAME_LOWER}" != *parcel* && "${SVC_NAME_LOWER}" != *sale* && \
-                      "${SVC_NAME_LOWER}" != *propert* && "${SVC_NAME_LOWER}" != *tax* && \
-                      "${SVC_NAME_LOWER}" != *real* && "${SVC_NAME_LOWER}" != *cama* ]]; then
-                  continue
+          d = json.load(open('data/probe.json'))
+          print(len(d.get('features', [])))" 2>/dev/null)
+                if (( FEAT_COUNT > 0 )); then
+                  LAYER_URL="${BASE}/${LID}/query"
+                  echo "Using layer: ${BASE}/${LID}"
+                  break 2
                 fi
-                echo "    Probing service: ${SVC_URL}"
-                if ! curl -fsSL --max-time 10 -o data/svc_probe.json "${SVC_URL}?f=json" 2>/dev/null; then
-                  continue
-                fi
-                LAYERS=$(python3 -c "
-          import json
-          d = json.load(open('data/svc_probe.json'))
-          if 'error' in d: exit()
-          for l in d.get('layers', []):
-              print(f\"{l['id']}:{l.get('name','')}\")
-          " 2>/dev/null)
-                [[ -z "${LAYERS}" ]] && continue
-                echo "      Layers: ${LAYERS}"
-
-                while IFS=: read -r LID LNAME; do
-                  QUERY_URL="${SVC_URL}/${LID}/query"
-                  if curl -fsSL --max-time 15 -o data/layer_probe.json \
-                    "${QUERY_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1" 2>/dev/null; then
-                    HAS_SALES=$(python3 -c "
-          import json
-          d = json.load(open('data/layer_probe.json'))
-          feats = d.get('features', [])
-          if not feats: print('no'); exit()
-          flds = list(feats[0].get('attributes', {}).keys())
-          print('Fields: ' + ', '.join(flds[:20]))
-          sale = [f for f in flds if any(k in f.lower() for k in ['sale','price','transfer','deed'])]
-          pid = [f for f in flds if any(k in f.lower() for k in ['parcel','pid','pin'])]
-          if sale: print('Sale fields: ' + ', '.join(sale))
-          if pid: print('Parcel fields: ' + ', '.join(pid))
-          print('yes' if sale and pid else 'no')
-          " 2>/dev/null)
-                    echo "      Layer ${LID} (${LNAME}): ${HAS_SALES}"
-                    if [[ "${HAS_SALES}" == *$'\n'"yes" || "${HAS_SALES}" == "yes" ]]; then
-                      SALES_EP="${QUERY_URL}"
-                      echo "Found sales endpoint: ${SALES_EP} (layer ${LID}: ${LNAME})"
-                      break 4
-                    fi
-                  fi
-                done <<< "${LAYERS}"
-              done <<< "${SERVICES}"
+              fi
             done
           done
 
-          if [[ -z "${SALES_EP}" ]]; then
-            echo "::error ::No Parcel_Sales source available (ZIP 404, no REST API with sales data found)."
-            echo "Searched ${#ARC_ROOTS[@]} servers x ${#FOLDERS_TO_SEARCH[@]} folders."
+          if [[ -z "${LAYER_URL}" ]]; then
+            echo "::error ::NC OneMap Parcels service unreachable from all known URLs."
             exit 1
           fi
+          echo "layer_url=${LAYER_URL}" >> "$GITHUB_OUTPUT"
 
-          # --- Paginated REST API download ---
-          echo "Downloading sales data from REST API: ${SALES_EP}"
+          # Discover field names from sample record
+          SCHEMA=$(python3 << 'PYEOF'
+          import json, sys
+
+          d = json.load(open('data/probe.json'))
+          feat = d['features'][0]
+          attrs = feat.get('attributes', {})
+          fields = list(attrs.keys())
+          print(f"ALL_FIELDS: {', '.join(fields)}", file=sys.stderr)
+
+          def find_field(keywords, exclude=None):
+              for f in fields:
+                  fl = f.lower()
+                  if exclude and any(e in fl for e in exclude):
+                      continue
+                  if any(k in fl for k in keywords):
+                      return f
+              return ""
+
+          county_field = find_field(['cntyname', 'county_nam', 'county', 'fips'])
+          parcel_field = find_field(['parno', 'parcel_id', 'pid', 'pin', 'reid', 'parcelid'])
+          price_field = find_field(['saleprice', 'sale_price', 'totalsaleprice', 'price', 'consideration'])
+          date_field = find_field(['saledate', 'sale_date', 'datesold', 'deed_date'], exclude=['txt'])
+          addr_field = find_field(['siteadd', 'site_addr', 'phyadd', 'address', 'propaddr', 'full_addre'], exclude=['city', 'zip', 'state'])
+          city_field = find_field(['site_city', 'citydesc', 'city_name', 'city', 'nme_city'], exclude=['zip', 'addr', 'add'])
+          zip_field = find_field(['site_zip', 'zipcode', 'zip_code', 'cde_zip', 'zip', 'postalcode'])
+          altparcel_field = find_field(['altparno', 'alt_parno', 'propertyid', 'property_id'])
+
+          # Detect date format from sample value
+          sample_date = attrs.get(date_field, None) if date_field else None
+          date_fmt = "unknown"
+          if sample_date is not None:
+              if isinstance(sample_date, (int, float)) and sample_date > 1e10:
+                  date_fmt = "epoch_ms"
+              elif isinstance(sample_date, (int, float)):
+                  date_fmt = "epoch_s"
+              elif isinstance(sample_date, str) and len(sample_date) >= 10:
+                  date_fmt = "string"
+              else:
+                  date_fmt = "unknown"
+
+          print(f"county_field={county_field}")
+          print(f"parcel_field={parcel_field}")
+          print(f"price_field={price_field}")
+          print(f"date_field={date_field}")
+          print(f"date_format={date_fmt}")
+          print(f"addr_field={addr_field}")
+          print(f"city_field={city_field}")
+          print(f"zip_field={zip_field}")
+          print(f"altparcel_field={altparcel_field}")
+          print(f"sample_date={sample_date}")
+
+          # Verify critical fields exist
+          missing = []
+          if not parcel_field: missing.append("parcel ID")
+          if not price_field: missing.append("sale price")
+          if not date_field: missing.append("sale date")
+          if missing:
+              print(f"MISSING: {', '.join(missing)}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+          )
+
+          echo "=== Schema Discovery ==="
+          echo "${SCHEMA}"
+
+          # Parse outputs
+          while IFS='=' read -r KEY VAL; do
+            echo "${KEY}=${VAL}" >> "$GITHUB_OUTPUT"
+          done <<< "${SCHEMA}"
+
+      - name: Download Mecklenburg parcels from NC OneMap
+        id: download
+        run: |
+          set -euo pipefail
+
+          LAYER_URL="${{ steps.schema.outputs.layer_url }}"
+          COUNTY_FIELD="${{ steps.schema.outputs.county_field }}"
+          PRICE_FIELD="${{ steps.schema.outputs.price_field }}"
+          PARCEL_FIELD="${{ steps.schema.outputs.parcel_field }}"
+          DATE_FIELD="${{ steps.schema.outputs.date_field }}"
+          ADDR_FIELD="${{ steps.schema.outputs.addr_field }}"
+          CITY_FIELD="${{ steps.schema.outputs.city_field }}"
+          ZIP_FIELD="${{ steps.schema.outputs.zip_field }}"
+          ALTPARCEL_FIELD="${{ steps.schema.outputs.altparcel_field }}"
+
+          # Build outFields list (only request what we need)
+          OUT_FIELDS="${PARCEL_FIELD},${PRICE_FIELD},${DATE_FIELD}"
+          [[ -n "${ADDR_FIELD}" ]] && OUT_FIELDS="${OUT_FIELDS},${ADDR_FIELD}"
+          [[ -n "${CITY_FIELD}" ]] && OUT_FIELDS="${OUT_FIELDS},${CITY_FIELD}"
+          [[ -n "${ZIP_FIELD}" ]] && OUT_FIELDS="${OUT_FIELDS},${ZIP_FIELD}"
+          [[ -n "${ALTPARCEL_FIELD}" ]] && OUT_FIELDS="${OUT_FIELDS},${ALTPARCEL_FIELD}"
+          [[ -n "${COUNTY_FIELD}" ]] && OUT_FIELDS="${OUT_FIELDS},${COUNTY_FIELD}"
+
+          # Build WHERE clause
+          if [[ -n "${COUNTY_FIELD}" ]]; then
+            WHERE="${COUNTY_FIELD}='MECKLENBURG' AND ${PRICE_FIELD}>0"
+          else
+            WHERE="${PRICE_FIELD}>0"
+          fi
+          WHERE_ENC=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "${WHERE}")
+
+          echo "Query: WHERE ${WHERE}"
+          echo "Fields: ${OUT_FIELDS}"
+
           BATCH=2000
           OFFSET=0
           TOTAL=0
 
           while true; do
-            API_URL="${SALES_EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
-            echo "Fetching sales batch: offset=${OFFSET} ..."
-            if ! curl -fL --retry 2 --retry-delay 3 --max-time 120 \
-              -o data/sales_batch.json "${API_URL}"; then
-              echo "::warning ::REST API request failed at offset ${OFFSET}."
+            API_URL="${LAYER_URL}?where=${WHERE_ENC}&outFields=${OUT_FIELDS}&returnGeometry=true&outSR=4326&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
+            echo "Fetching batch: offset=${OFFSET} ..."
+            if ! curl -fL --retry 2 --retry-delay 5 --max-time 120 \
+              -o data/batch.json "${API_URL}"; then
+              echo "::warning ::Request failed at offset ${OFFSET}."
               break
             fi
-            echo "Response: $(wc -c < data/sales_batch.json) bytes"
 
             FEAT_COUNT=$(python3 -c "
           import json, sys
           try:
-              d = json.load(open('data/sales_batch.json'))
-              if 'error' in d: print('API error: ' + json.dumps(d['error']), file=sys.stderr)
+              d = json.load(open('data/batch.json'))
+              if 'error' in d: print('API error: ' + str(d['error']), file=sys.stderr)
               print(len(d.get('features', [])))
-          except Exception as e:
-              print(0)
+          except: print(0)
           ")
             if (( FEAT_COUNT == 0 )); then
-              echo "No more features. Done."
+              echo "No more features at offset ${OFFSET}."
               break
             fi
 
             if (( TOTAL == 0 )); then
-              ogr2ogr -f GPKG data/sales.gpkg data/sales_batch.json \
+              ogr2ogr -f GPKG data/sales.gpkg data/batch.json \
                 -t_srs EPSG:4326 -nln sales -overwrite
             else
-              ogr2ogr -f GPKG data/sales.gpkg data/sales_batch.json \
+              ogr2ogr -f GPKG data/sales.gpkg data/batch.json \
                 -t_srs EPSG:4326 -nln sales -append
             fi
             TOTAL=$((TOTAL + FEAT_COUNT))
@@ -196,585 +201,220 @@ jobs:
 
             EXCEEDED=$(python3 -c "
           import json
-          d = json.load(open('data/sales_batch.json'))
+          d = json.load(open('data/batch.json'))
           print('true' if d.get('exceededTransferLimit', False) else 'false')
           ")
             [[ "${EXCEEDED}" != "true" ]] && break
           done
 
-          echo "Total sales records from REST API: ${TOTAL}"
+          echo "Total records downloaded: ${TOTAL}"
           if (( TOTAL == 0 )); then
-            echo "::error ::No sales records loaded."
+            echo "::error ::No parcels downloaded from NC OneMap."
             exit 1
           fi
-          echo "source=rest" > data/sales_source.txt
 
-      - name: Reproject Parcel_Sales to GPKG (layer 'sales')
+      - name: Verify data and check freshness
         run: |
           set -euo pipefail
-          if [[ -f data/sales_source.txt ]] && grep -q "source=rest" data/sales_source.txt; then
-            echo "Sales data already in GPKG from REST API. Skipping reproject."
-            exit 0
-          fi
-          echo "=== Available shapefiles ==="
-          ls -la data/shp/*.shp
-          SHP_FILE=$(ls data/shp/*.shp | head -n 1)
-          echo "Using shapefile: ${SHP_FILE}"
-          ogr2ogr -f GPKG data/sales.gpkg "$SHP_FILE" -t_srs EPSG:4326 -nln sales -overwrite
 
-      - name: Inspect sales fields
-        run: |
           echo "=== Sales layer schema ==="
           ogrinfo -ro -so -al data/sales.gpkg sales
 
-      - name: Check source staleness (warn-only)
-        run: |
-          set -euo pipefail
-          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate, 1, 10)) FROM sales;")
-          if [[ -z "${MAX_DATE:-}" || "${MAX_DATE}" == "NULL" ]]; then
-            echo "::warning ::Couldn't determine MAX(saledate) from source."
+          SALES_COUNT=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales;")
+          echo "Total rows: ${SALES_COUNT}"
+
+          DATE_FIELD="${{ steps.schema.outputs.date_field }}"
+          DATE_FMT="${{ steps.schema.outputs.date_format }}"
+          PRICE_FIELD="${{ steps.schema.outputs.price_field }}"
+
+          echo "=== Date field diagnostics ==="
+          sqlite3 data/sales.gpkg "SELECT ${DATE_FIELD}, typeof(${DATE_FIELD}) FROM sales WHERE ${DATE_FIELD} IS NOT NULL LIMIT 5;"
+
+          if [[ "${DATE_FMT}" == "epoch_ms" ]]; then
+            MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT strftime('%Y-%m-%d', ${DATE_FIELD}/1000, 'unixepoch') FROM sales WHERE ${PRICE_FIELD} > 0 ORDER BY ${DATE_FIELD} DESC LIMIT 1;")
           else
-            NOW_UTC=$(date -u +%s)
-            MAX_EPOCH=$(date -u -d "$MAX_DATE" +%s)
-            AGE_DAYS=$(( (NOW_UTC - MAX_EPOCH) / 86400 ))
-            echo "MAX(saledate)=${MAX_DATE}  age=${AGE_DAYS}d"
-            if (( AGE_DAYS > 3 )); then
-              echo "::warning ::Source dataset appears stale (MAX(saledate)=${MAX_DATE}, ${AGE_DAYS} days old). Proceeding anyway."
-            fi
+            MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(${DATE_FIELD}, 1, 10)) FROM sales WHERE ${PRICE_FIELD} > 0;")
           fi
 
-      - name: Probe REST API for fresh sales data (if ZIP is stale)
-        id: sales_probe
-        run: |
-          set -euo pipefail
-          MAX_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate,1,10)) FROM sales;")
+          echo "Most recent sale date: ${MAX_DATE}"
+          if [[ -z "${MAX_DATE}" || "${MAX_DATE}" == "NULL" ]]; then
+            echo "::error ::Could not determine most recent sale date."
+            exit 1
+          fi
+
           NOW_UTC=$(date -u +%s)
-          MAX_EPOCH=$(date -u -d "$MAX_DATE" +%s 2>/dev/null || echo 0)
+          MAX_EPOCH=$(date -u -d "${MAX_DATE}" +%s 2>/dev/null || echo 0)
           AGE_DAYS=$(( (NOW_UTC - MAX_EPOCH) / 86400 ))
+          echo "Data age: ${AGE_DAYS} days"
 
-          if (( AGE_DAYS <= 90 )); then
-            echo "ZIP data is fresh enough (${AGE_DAYS} days old). Skipping REST probe."
-            echo "use_rest=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if (( AGE_DAYS > 90 )); then
+            echo "::error ::Data is ${AGE_DAYS} days stale (max date: ${MAX_DATE})."
+            exit 1
+          elif (( AGE_DAYS > 14 )); then
+            echo "::warning ::Data is ${AGE_DAYS} days old (max date: ${MAX_DATE})."
           fi
 
-          echo "ZIP data is ${AGE_DAYS} days stale (max=${MAX_DATE}). Probing REST APIs for fresh sales data..."
-
-          # Endpoints to probe for sales data (layer 2 = Tax Parcels on MAT MapServer)
-          SALES_REST_ENDPOINTS=(
-            "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer/2/query"
-            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/2/query"
-            "https://gis.charlottenc.gov/arcgis/rest/services/CountyData/Parcels/MapServer/0/query"
-          )
-
-          for EP in "${SALES_REST_ENDPOINTS[@]}"; do
-            echo "Probing: ${EP}"
-            if curl -fsSL --max-time 15 \
-              -o data/sales_probe.json \
-              "${EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1"; then
-              PROBE_INFO=$(python3 -c "
-          import json, sys
-          try:
-              d = json.load(open('data/sales_probe.json'))
-              feats = d.get('features', [])
-              if not feats:
-                  print('no_features')
-                  sys.exit(0)
-              fields = list(feats[0].get('attributes', {}).keys())
-              print('Fields: ' + ', '.join(fields))
-              # Check for sales-related fields
-              sales_fields = [f for f in fields if any(kw in f.lower() for kw in ['sale', 'price', 'transfer'])]
-              if sales_fields:
-                  print('SALES_FIELDS: ' + ', '.join(sales_fields))
-              else:
-                  print('NO_SALES_FIELDS')
-          except Exception as e:
-              print('error: ' + str(e))
-          " 2>&1)
-              echo "${PROBE_INFO}"
-              if [[ "${PROBE_INFO}" == *"SALES_FIELDS:"* ]]; then
-                echo "Found REST endpoint with sales data: ${EP}"
-                echo "use_rest=true" >> "$GITHUB_OUTPUT"
-                echo "rest_url=${EP}" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            else
-              echo "  (unreachable or error)"
-            fi
-          done
-
-          echo "No REST API with sales fields found. Using ZIP data as-is."
-          echo "use_rest=false" >> "$GITHUB_OUTPUT"
-
-      - name: Detect address fields in sales layer
-        id: detect_fields
-        run: |
-          set -euo pipefail
-          FIELDS=$(sqlite3 data/sales.gpkg "PRAGMA table_info(sales);" | cut -d'|' -f2 | tr '\n' ',' )
-          echo "Available fields: ${FIELDS}"
-
-          HAS_ADDR=$(sqlite3 data/sales.gpkg "
-            SELECT COUNT(*) FROM pragma_table_info('sales')
-            WHERE lower(name) IN ('site_addr','siteaddres','siteaddress','site_address','address','full_addre','propaddr','location_a','street_add')
-          ")
-          HAS_CITY=$(sqlite3 data/sales.gpkg "
-            SELECT COUNT(*) FROM pragma_table_info('sales')
-            WHERE lower(name) IN ('city','nme_city','site_city','citydesc','city_name')
-          ")
-          HAS_ZIP=$(sqlite3 data/sales.gpkg "
-            SELECT COUNT(*) FROM pragma_table_info('sales')
-            WHERE lower(name) IN ('zipcode','zip','zip_code','cde_zip1','site_zip','postalcode')
-          ")
-
-          echo "has_addr=${HAS_ADDR}"
-          echo "has_city=${HAS_CITY}"
-          echo "has_zip=${HAS_ZIP}"
-
-          if (( HAS_ADDR > 0 )); then
-            ADDR_FIELD=$(sqlite3 data/sales.gpkg "
-              SELECT name FROM pragma_table_info('sales')
-              WHERE lower(name) IN ('site_addr','siteaddres','siteaddress','site_address','address','full_addre','propaddr','location_a','street_add')
-              LIMIT 1
-            ")
-            echo "addr_field=${ADDR_FIELD}" >> "$GITHUB_OUTPUT"
-          fi
-          if (( HAS_CITY > 0 )); then
-            CITY_FIELD=$(sqlite3 data/sales.gpkg "
-              SELECT name FROM pragma_table_info('sales')
-              WHERE lower(name) IN ('city','nme_city','site_city','citydesc','city_name')
-              LIMIT 1
-            ")
-            echo "city_field=${CITY_FIELD}" >> "$GITHUB_OUTPUT"
-          fi
-          if (( HAS_ZIP > 0 )); then
-            ZIP_FIELD=$(sqlite3 data/sales.gpkg "
-              SELECT name FROM pragma_table_info('sales')
-              WHERE lower(name) IN ('zipcode','zip','zip_code','cde_zip1','site_zip','postalcode')
-              LIMIT 1
-            ")
-            echo "zip_field=${ZIP_FIELD}" >> "$GITHUB_OUTPUT"
-          fi
-
-          if (( HAS_ADDR > 0 )); then
-            echo "strategy=sales_direct" >> "$GITHUB_OUTPUT"
-            echo "Address fields found in Parcel_Sales — will use directly (no MAT needed)."
-          else
-            echo "strategy=needs_mat" >> "$GITHUB_OUTPUT"
-            echo "No address fields in Parcel_Sales — will attempt MAT download."
-          fi
-
-      - name: Download MAT (if needed for addresses)
-        if: steps.detect_fields.outputs.strategy == 'needs_mat'
-        id: mat_download
-        run: |
-          set -euo pipefail
-
-          # --- Attempt 1: ZIP download ---
-          TS="$(date +%s)"
-          MAT_URLS=(
-            "https://maps.mecklenburgcountync.gov/opendata/MAT.zip?nocache=${TS}"
-            "https://maps.mecknc.gov/opendata/MAT.zip?nocache=${TS}"
-          )
-
-          ZIP_OK=false
-          for URL in "${MAT_URLS[@]}"; do
-            echo "Trying MAT ZIP download: ${URL}"
-            if curl -fL --retry 3 --retry-delay 5 \
-              -H "Cache-Control: no-cache" \
-              -o data/MAT.zip \
-              "${URL}"; then
-              echo "Downloaded MAT ZIP from: ${URL}"
-              unzip -o data/MAT.zip -d data/mat
-              MAT_SHP=$(ls data/mat/*.shp 2>/dev/null | head -n 1)
-              if [[ -n "${MAT_SHP}" ]]; then
-                echo "Using MAT shapefile: ${MAT_SHP}"
-                ogr2ogr -f GPKG data/sales.gpkg "$MAT_SHP" -t_srs EPSG:4326 -nln mat -append
-                ZIP_OK=true
-              fi
-              break
-            fi
-          done
-
-          if [[ "${ZIP_OK}" == "true" ]]; then
-            echo "mat_available=true" >> "$GITHUB_OUTPUT"
-            echo "=== MAT layer schema ==="
-            ogrinfo -ro -so -al data/sales.gpkg mat
-            exit 0
-          fi
-
-          echo "MAT ZIP unavailable from all URLs. Falling back to ArcGIS REST API..."
-
-          # --- Attempt 2: ArcGIS REST API with pagination ---
-          REST_ENDPOINTS=(
-            "https://edmsgis.mecklenburgcountync.gov/server/rest/services/GIS/MAT/MapServer/0/query"
-            "https://maps.mecklenburgcountync.gov/agsadaptor/rest/services/GIS/MAT/MapServer/0/query"
-            "https://gis.charlottenc.gov/arcgis/rest/services/Accela/Accela/MapServer/1/query"
-          )
-          BATCH=2000
-
-          # Find a working REST endpoint by fetching 1 record with all fields
-          BASE_URL=""
-          for EP in "${REST_ENDPOINTS[@]}"; do
-            echo "Testing REST endpoint: ${EP}"
-            if curl -fsSL --max-time 15 \
-              -o data/mat_probe.json \
-              "${EP}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultRecordCount=1"; then
-              PROBE_COUNT=$(python3 -c "
-          import json
-          d = json.load(open('data/mat_probe.json'))
-          feats = d.get('features', [])
-          print(len(feats))
-          if feats:
-              print('Fields: ' + ', '.join(feats[0].get('attributes', {}).keys()), flush=True)
-          " 2>&1)
-              echo "Probe result: ${PROBE_COUNT}"
-              if [[ "${PROBE_COUNT}" == *"Fields:"* ]]; then
-                BASE_URL="${EP}"
-                echo "Using REST endpoint: ${BASE_URL}"
-                break
-              fi
-            fi
-            echo "Endpoint unavailable or returned no features, trying next..."
-          done
-
-          if [[ -z "${BASE_URL}" ]]; then
-            echo "::warning ::No MAT REST endpoint reachable — addresses will be empty."
-            echo "mat_available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          OFFSET=0
-          TOTAL=0
-          FIRST=true
-
-          while true; do
-            API_URL="${BASE_URL}?where=1%3D1&outFields=*&returnGeometry=true&f=json&resultOffset=${OFFSET}&resultRecordCount=${BATCH}"
-            echo "Fetching MAT batch: offset=${OFFSET} ..."
-
-            if ! curl -fL --retry 2 --retry-delay 3 --max-time 60 \
-              -o data/mat_batch.json "${API_URL}"; then
-              echo "::warning ::MAT REST API request failed at offset ${OFFSET}."
-              break
-            fi
-
-            # Log response size for debugging
-            echo "Response size: $(wc -c < data/mat_batch.json) bytes"
-
-            # Check how many features we got
-            FEAT_COUNT=$(python3 -c "
-          import json, sys
-          try:
-              d = json.load(open('data/mat_batch.json'))
-              if 'error' in d:
-                  print('API error: ' + json.dumps(d['error']), file=sys.stderr)
-              print(len(d.get('features', [])))
-          except Exception as e:
-              print('Parse error: ' + str(e), file=sys.stderr)
-              print(0)
-          ")
-
-            if (( FEAT_COUNT == 0 )); then
-              echo "No more features at offset ${OFFSET}. Done."
-              break
-            fi
-
-            ogr2ogr -f GPKG data/sales.gpkg data/mat_batch.json \
-              -t_srs EPSG:4326 -nln mat -append
-
-            TOTAL=$((TOTAL + FEAT_COUNT))
-            OFFSET=$((OFFSET + BATCH))
-
-            # Check if server indicated more results
-            EXCEEDED=$(python3 -c "
-          import json
-          d = json.load(open('data/mat_batch.json'))
-          print('true' if d.get('exceededTransferLimit', False) else 'false')
-          ")
-            if [[ "${EXCEEDED}" != "true" ]]; then
-              echo "Server indicates no more pages. Done."
-              break
-            fi
-          done
-
-          echo "Total MAT records loaded via REST API: ${TOTAL}"
-
-          if (( TOTAL > 0 )); then
-            echo "mat_available=true" >> "$GITHUB_OUTPUT"
-            echo "=== MAT layer schema ==="
-            ogrinfo -ro -so -al data/sales.gpkg mat
-          else
-            echo "::warning ::Could not load MAT from ZIP or REST API — addresses will be empty."
-            echo "mat_available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Discover actual MAT field names for address, city, zip
-          MAT_FIELDS=$(sqlite3 data/sales.gpkg "PRAGMA table_info(mat);" | cut -d'|' -f2 | tr '\n' ',' )
-          echo "MAT fields: ${MAT_FIELDS}"
-
-          MAT_ADDR=$(sqlite3 data/sales.gpkg "
-            SELECT name FROM pragma_table_info('mat')
-            WHERE lower(name) IN ('full_addre','full_address','address','siteaddres','siteaddress','site_addr','site_address','propaddr','street_add','location_a','txt_addres')
-            LIMIT 1
-          ")
-          echo "mat_addr_field=${MAT_ADDR:-(none)}"
-          echo "mat_addr_field=${MAT_ADDR}" >> "$GITHUB_OUTPUT"
-
-          MAT_CITY=$(sqlite3 data/sales.gpkg "
-            SELECT name FROM pragma_table_info('mat')
-            WHERE lower(name) IN ('nme_city','nme_po_cit','city','city_name','site_city','citydesc','municipali')
-            LIMIT 1
-          ")
-          echo "mat_city_field=${MAT_CITY:-(none)}"
-          echo "mat_city_field=${MAT_CITY}" >> "$GITHUB_OUTPUT"
-
-          MAT_ZIP=$(sqlite3 data/sales.gpkg "
-            SELECT name FROM pragma_table_info('mat')
-            WHERE lower(name) IN ('cde_zip1','zipcode','zip','zip_code','site_zip','postalcode','postal_cod')
-            LIMIT 1
-          ")
-          echo "mat_zip_field=${MAT_ZIP:-(none)}"
-          echo "mat_zip_field=${MAT_ZIP}" >> "$GITHUB_OUTPUT"
+          echo "=== Price distribution ==="
+          sqlite3 data/sales.gpkg "
+            SELECT
+              MIN(${PRICE_FIELD}) AS min_price,
+              MAX(${PRICE_FIELD}) AS max_price,
+              CAST(AVG(${PRICE_FIELD}) AS INTEGER) AS avg_price,
+              COUNT(*) AS total
+            FROM sales WHERE ${PRICE_FIELD} > 0;
+          "
 
       - name: Build CSV
         run: |
           set -euo pipefail
 
-          STRATEGY="${{ steps.detect_fields.outputs.strategy }}"
-          MAT_OK="${{ steps.mat_download.outputs.mat_available }}"
-          ADDR_FIELD="${{ steps.detect_fields.outputs.addr_field }}"
-          CITY_FIELD="${{ steps.detect_fields.outputs.city_field }}"
-          ZIP_FIELD="${{ steps.detect_fields.outputs.zip_field }}"
+          PARCEL_FIELD="${{ steps.schema.outputs.parcel_field }}"
+          PRICE_FIELD="${{ steps.schema.outputs.price_field }}"
+          DATE_FIELD="${{ steps.schema.outputs.date_field }}"
+          DATE_FMT="${{ steps.schema.outputs.date_format }}"
+          ADDR_FIELD="${{ steps.schema.outputs.addr_field }}"
+          CITY_FIELD="${{ steps.schema.outputs.city_field }}"
+          ZIP_FIELD="${{ steps.schema.outputs.zip_field }}"
+          ALTPARCEL_FIELD="${{ steps.schema.outputs.altparcel_field }}"
 
-          # --- Pre-flight diagnostics ---
-          echo "=== GDAL version ==="
-          ogr2ogr --version
-          echo "=== Sales table columns ==="
-          sqlite3 data/sales.gpkg "PRAGMA table_info(sales);" | cut -d'|' -f2
-          SALES_COUNT=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales;")
-          echo "Sales row count: ${SALES_COUNT}"
-          echo "=== Sample saledate values ==="
-          sqlite3 data/sales.gpkg "SELECT saledate, typeof(saledate) FROM sales WHERE saledate IS NOT NULL LIMIT 5;"
-          echo "=== Date range and filter diagnostics ==="
-          sqlite3 data/sales.gpkg "
-            SELECT 'max_saledate' AS metric, MAX(substr(saledate,1,10)) AS value FROM sales
-            UNION ALL SELECT 'min_saledate', MIN(substr(saledate,1,10)) FROM sales
-            UNION ALL SELECT 'date_threshold_now', date('now','-12 months')
-            UNION ALL SELECT 'rows_date_match_now', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months')
-            UNION ALL SELECT 'rows_price_gt_0', CAST(COUNT(*) AS TEXT) FROM sales WHERE saleprice IS NOT NULL AND saleprice > 0
-            UNION ALL SELECT 'rows_both_filters_now', CAST(COUNT(*) AS TEXT) FROM sales WHERE substr(saledate,1,10) >= date('now','-12 months') AND saleprice IS NOT NULL AND saleprice > 0;
-          "
-          echo "=== Sample recent saleprice values ==="
-          sqlite3 data/sales.gpkg "SELECT substr(saledate,1,10) AS dt, saleprice, typeof(saleprice) FROM sales ORDER BY substr(saledate,1,10) DESC LIMIT 5;"
-          if (( SALES_COUNT == 0 )); then
-            echo "::error ::Sales table is empty."
-            exit 1
+          # Build date expression based on detected format
+          if [[ "${DATE_FMT}" == "epoch_ms" ]]; then
+            DATE_EXPR="strftime('%Y-%m-%d', ${DATE_FIELD}/1000, 'unixepoch')"
+          elif [[ "${DATE_FMT}" == "epoch_s" ]]; then
+            DATE_EXPR="strftime('%Y-%m-%d', ${DATE_FIELD}, 'unixepoch')"
+          else
+            DATE_EXPR="substr(${DATE_FIELD}, 1, 10)"
           fi
-          MISSING=""
-          for COL in saledate saleprice parcelid propertyid; do
-            EXISTS=$(sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM pragma_table_info('sales') WHERE lower(name)=lower('${COL}');")
-            if (( EXISTS == 0 )); then MISSING="${MISSING} ${COL}"; fi
-          done
-          if [[ -n "${MISSING}" ]]; then
-            echo "::error ::Sales table missing required columns:${MISSING}"
-            echo "Available columns:"
-            sqlite3 data/sales.gpkg "PRAGMA table_info(sales);"
-            exit 1
-          fi
-          echo "=== Strategy: ${STRATEGY}, MAT available: ${MAT_OK} ==="
 
-          # Compute date cutoff: last 12 months of available data (not from today)
-          MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(saledate,1,10)) FROM sales WHERE saleprice IS NOT NULL AND saleprice > 0;")
-          if [[ -z "${MAX_SALE_DATE}" || "${MAX_SALE_DATE}" == "NULL" ]]; then
-            echo "::error ::No valid sales found in dataset."
-            exit 1
+          # Build address expressions
+          if [[ -n "${ADDR_FIELD}" ]]; then ADDR_EXPR="COALESCE(${ADDR_FIELD}, '')"; else ADDR_EXPR="''"; fi
+          if [[ -n "${CITY_FIELD}" ]]; then CITY_EXPR="COALESCE(${CITY_FIELD}, '')"; else CITY_EXPR="''"; fi
+          if [[ -n "${ZIP_FIELD}" ]]; then ZIP_EXPR="COALESCE(${ZIP_FIELD}, '')"; else ZIP_EXPR="''"; fi
+
+          # Use altparcel for pid if available, otherwise same as parcelid
+          if [[ -n "${ALTPARCEL_FIELD}" ]]; then
+            PID_EXPR="${ALTPARCEL_FIELD}"
+          else
+            PID_EXPR="${PARCEL_FIELD}"
+          fi
+
+          # Compute adaptive date cutoff (last 12 months of available data)
+          if [[ "${DATE_FMT}" == "epoch_ms" ]]; then
+            MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT strftime('%Y-%m-%d', MAX(${DATE_FIELD})/1000, 'unixepoch') FROM sales WHERE ${PRICE_FIELD} > 0;")
+          else
+            MAX_SALE_DATE=$(sqlite3 data/sales.gpkg "SELECT MAX(substr(${DATE_FIELD}, 1, 10)) FROM sales WHERE ${PRICE_FIELD} > 0;")
           fi
           DATE_CUTOFF=$(sqlite3 data/sales.gpkg "SELECT date('${MAX_SALE_DATE}', '-12 months');")
-          echo "Most recent sale: ${MAX_SALE_DATE}, cutoff (12 months prior): ${DATE_CUTOFF}"
+          echo "Most recent sale: ${MAX_SALE_DATE}, cutoff: ${DATE_CUTOFF}"
 
-          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" || true
+          # Build spatial index
+          ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('sales','geom')" 2>/dev/null || true
 
-          if [[ "${STRATEGY}" == "sales_direct" ]]; then
-            echo "Using address fields directly from Parcel_Sales layer."
-            if [[ -n "${ADDR_FIELD}" ]]; then ADDR_EXPR="COALESCE(s.${ADDR_FIELD}, '')"; else ADDR_EXPR="''"; fi
-            if [[ -n "${CITY_FIELD}" ]]; then CITY_EXPR="COALESCE(s.${CITY_FIELD}, '')"; else CITY_EXPR="''"; fi
-            if [[ -n "${ZIP_FIELD}" ]]; then ZIP_EXPR="COALESCE(s.${ZIP_FIELD}, '')"; else ZIP_EXPR="''"; fi
-
-            cat > data/query.sql <<SQL
-            WITH recent AS (
-              SELECT
-                s.geom, s.parcelid, s.propertyid AS pid,
-                s.saleprice, s.saledate,
-                ${ADDR_EXPR} AS address,
-                ${CITY_EXPR} AS city,
-                ${ZIP_EXPR}  AS zipcode
-              FROM sales s
-              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
-                AND s.saleprice IS NOT NULL AND s.saleprice > 0
-            ),
-            latest AS (
-              SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
-              ) AS rn
-              FROM recent
-            )
+          cat > data/query.sql <<SQL
+          WITH recent AS (
             SELECT
-              CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
-              CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
-              pid, parcelid, address, city, zipcode,
-              substr(saledate, 1, 10) AS saledate,
-              saleprice
-            FROM latest WHERE rn = 1
-            ORDER BY substr(saledate, 1, 10) DESC;
+              geom,
+              ${PARCEL_FIELD} AS parcelid,
+              ${PID_EXPR} AS pid,
+              ${PRICE_FIELD} AS saleprice,
+              ${DATE_EXPR} AS saledate,
+              ${ADDR_EXPR} AS address,
+              ${CITY_EXPR} AS city,
+              ${ZIP_EXPR} AS zipcode
+            FROM sales
+            WHERE ${PRICE_FIELD} > 0
+              AND ${DATE_EXPR} >= '${DATE_CUTOFF}'
+          ),
+          latest AS (
+            SELECT *, ROW_NUMBER() OVER (
+              PARTITION BY parcelid ORDER BY saledate DESC
+            ) AS rn
+            FROM recent
+          )
+          SELECT
+            CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
+            CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
+            pid, parcelid, address, city, zipcode,
+            saledate, saleprice
+          FROM latest WHERE rn = 1
+          ORDER BY saledate DESC;
           SQL
-
-          elif [[ "${STRATEGY}" == "needs_mat" && "${MAT_OK}" == "true" ]]; then
-            echo "Using MAT spatial join for address data."
-            ogrinfo data/sales.gpkg -sql "SELECT gpkgAddSpatialIndex('mat','geom')" || true
-
-            MAT_ADDR_FIELD="${{ steps.mat_download.outputs.mat_addr_field }}"
-            MAT_CITY_FIELD="${{ steps.mat_download.outputs.mat_city_field }}"
-            MAT_ZIP_FIELD="${{ steps.mat_download.outputs.mat_zip_field }}"
-
-            # Build COALESCE expressions based on discovered fields
-            if [[ -n "${MAT_ADDR_FIELD}" ]]; then
-              ADDR_SQL="COALESCE(m.${MAT_ADDR_FIELD}, '')"
-            else
-              ADDR_SQL="''"
-            fi
-            if [[ -n "${MAT_CITY_FIELD}" ]]; then
-              CITY_SQL="COALESCE(m.${MAT_CITY_FIELD}, '')"
-            else
-              CITY_SQL="''"
-            fi
-            if [[ -n "${MAT_ZIP_FIELD}" ]]; then
-              ZIP_SQL="COALESCE(m.${MAT_ZIP_FIELD}, '')"
-            else
-              ZIP_SQL="''"
-            fi
-
-            echo "Address SQL: ${ADDR_SQL}"
-            echo "City SQL: ${CITY_SQL}"
-            echo "Zip SQL: ${ZIP_SQL}"
-
-            cat > data/query.sql <<SQL
-            WITH recent AS (
-              SELECT
-                s.geom, s.parcelid, s.propertyid AS pid,
-                s.saleprice, s.saledate
-              FROM sales s
-              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
-                AND s.saleprice IS NOT NULL AND s.saleprice > 0
-            ),
-            latest AS (
-              SELECT geom, parcelid, pid, saleprice, saledate,
-                ROW_NUMBER() OVER (
-                  PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
-                ) AS rn
-              FROM recent
-            ),
-            base AS (
-              SELECT * FROM latest WHERE rn = 1
-            ),
-            mat_join AS (
-              SELECT
-                b.parcelid,
-                ${ADDR_SQL} AS address,
-                ${CITY_SQL} AS city,
-                ${ZIP_SQL}  AS zipcode,
-                ROW_NUMBER() OVER (
-                  PARTITION BY b.parcelid
-                  ORDER BY (${ADDR_SQL} != '') DESC
-                ) AS addr_rank
-              FROM base b
-              LEFT JOIN mat m ON ST_Intersects(m.geom, b.geom)
-            )
-            SELECT
-              CAST(ST_X(ST_Centroid(b.geom)) AS REAL) AS lon,
-              CAST(ST_Y(ST_Centroid(b.geom)) AS REAL) AS lat,
-              b.pid, b.parcelid,
-              COALESCE(j.address, '')  AS address,
-              COALESCE(j.city, '')     AS city,
-              COALESCE(j.zipcode, '')  AS zipcode,
-              substr(b.saledate, 1, 10) AS saledate,
-              b.saleprice
-            FROM base b
-            LEFT JOIN mat_join j
-              ON b.parcelid = j.parcelid AND j.addr_rank = 1
-            ORDER BY substr(b.saledate, 1, 10) DESC;
-          SQL
-
-          else
-            echo "::warning ::No address source available — address/city/zipcode will be empty."
-            cat > data/query.sql <<SQL
-            WITH recent AS (
-              SELECT
-                s.geom, s.parcelid, s.propertyid AS pid,
-                s.saleprice, s.saledate
-              FROM sales s
-              WHERE substr(s.saledate, 1, 10) >= '${DATE_CUTOFF}'
-                AND s.saleprice IS NOT NULL AND s.saleprice > 0
-            ),
-            latest AS (
-              SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY parcelid ORDER BY substr(saledate, 1, 10) DESC
-              ) AS rn
-              FROM recent
-            )
-            SELECT
-              CAST(ST_X(ST_Centroid(geom)) AS REAL) AS lon,
-              CAST(ST_Y(ST_Centroid(geom)) AS REAL) AS lat,
-              pid, parcelid,
-              '' AS address, '' AS city, '' AS zipcode,
-              substr(saledate, 1, 10) AS saledate,
-              saleprice
-            FROM latest WHERE rn = 1
-            ORDER BY substr(saledate, 1, 10) DESC;
-          SQL
-          fi
 
           echo "=== Query ==="
           cat data/query.sql
-          echo ""
 
           OGR_EXIT=0
           ogr2ogr -f CSV public/parcel_sales.csv data/sales.gpkg \
             -dialect SQLite \
             -sql "$(cat data/query.sql)" || OGR_EXIT=$?
 
-          echo "ogr2ogr exit code: ${OGR_EXIT}"
-
           if [[ ! -f public/parcel_sales.csv ]]; then
-            echo "::error ::ogr2ogr did not create public/parcel_sales.csv (exit code: ${OGR_EXIT})"
-            echo "=== Query that was attempted ==="
-            cat data/query.sql
-            echo ""
-            echo "=== Diagnostic: filtered row count ==="
-            sqlite3 data/sales.gpkg "SELECT COUNT(*) AS cnt FROM sales WHERE substr(saledate, 1, 10) >= '${DATE_CUTOFF}' AND saleprice IS NOT NULL AND saleprice > 0;" || true
+            echo "::error ::ogr2ogr did not produce output (exit code: ${OGR_EXIT})"
+            echo "=== Diagnostic ==="
+            sqlite3 data/sales.gpkg "SELECT COUNT(*) FROM sales WHERE ${PRICE_FIELD} > 0 AND ${DATE_EXPR} >= '${DATE_CUTOFF}';"
             exit 1
           fi
 
-          echo "Output file created: $(wc -l < public/parcel_sales.csv) lines"
+          echo "Output rows: $(wc -l < public/parcel_sales.csv)"
 
       - name: Validate output
         run: |
           set -euo pipefail
+
           if [[ ! -f public/parcel_sales.csv ]]; then
-            echo "::error ::public/parcel_sales.csv does not exist — Build CSV step failed to produce output."
+            echo "::error ::public/parcel_sales.csv does not exist."
             exit 1
           fi
+
+          # Check header
+          HEADER=$(head -1 public/parcel_sales.csv)
+          EXPECTED="lon,lat,pid,parcelid,address,city,zipcode,saledate,saleprice"
+          if [[ "${HEADER}" != "${EXPECTED}" ]]; then
+            echo "::error ::Header mismatch. Expected: ${EXPECTED}"
+            echo "::error ::Got: ${HEADER}"
+            exit 1
+          fi
+
           ROW_COUNT=$(wc -l < public/parcel_sales.csv)
-          echo "Output rows (including header): ${ROW_COUNT}"
-          if (( ROW_COUNT < 2 )); then
-            echo "::error ::Output CSV is empty — something went wrong with the query."
+          TOTAL=$((ROW_COUNT - 1))
+          echo "Output rows: ${TOTAL}"
+
+          if (( TOTAL < 2 )); then
+            echo "::error ::Output CSV is empty."
             exit 1
           fi
+          if (( TOTAL < 5000 )); then
+            echo "::warning ::Only ${TOTAL} rows — expected 15,000-20,000."
+          fi
+          if (( TOTAL > 50000 )); then
+            echo "::warning ::${TOTAL} rows seems high — expected 15,000-20,000."
+          fi
+
+          # Address fill rate
           ADDR_FILLED=$(awk -F',' 'NR>1 && $5!="" {count++} END {print count+0}' public/parcel_sales.csv)
-          TOTAL=$((ROW_COUNT - 1))
           echo "Rows with address data: ${ADDR_FILLED}/${TOTAL}"
           if (( ADDR_FILLED == 0 )); then
-            echo "::warning ::No address data in output — all address fields are empty."
+            echo "::warning ::No address data — all address fields empty."
+          elif (( ADDR_FILLED * 100 / TOTAL < 80 )); then
+            echo "::warning ::Address fill rate below 80% (${ADDR_FILLED}/${TOTAL})."
           fi
+
+          # City coverage
+          CITIES=$(awk -F',' 'NR>1 && $6!="" {print $6}' public/parcel_sales.csv | sort -u | wc -l)
+          echo "Unique cities: ${CITIES}"
+          if (( CITIES < 5 )); then
+            echo "::warning ::Only ${CITIES} unique cities — expected 8-9 for Mecklenburg County."
+          fi
+
+          # Bounding box check (sample first 100 rows)
+          BAD_COORDS=$(awk -F',' 'NR>1 && NR<=101 {
+            if ($1 < -81.1 || $1 > -80.5 || $2 < 35.0 || $2 > 35.5) print NR": "$1","$2
+          }' public/parcel_sales.csv)
+          if [[ -n "${BAD_COORDS}" ]]; then
+            echo "::warning ::Some coordinates outside Mecklenburg County bbox:"
+            echo "${BAD_COORDS}" | head -5
+          fi
+
           echo ""
           echo "Sample output:"
           head -5 public/parcel_sales.csv
